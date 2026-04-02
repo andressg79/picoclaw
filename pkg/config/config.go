@@ -57,7 +57,19 @@ func (c *Config) FilterSensitiveData(content string) string {
 	if len(content) < c.Tools.GetFilterMinLength() {
 		return content
 	}
-	return c.SensitiveDataReplacer().Replace(content)
+
+	// 1. Apply literal replacements from config secrets
+	content = c.SensitiveDataReplacer().Replace(content)
+
+	// 2. Apply regex-based pattern redaction for common secret formats
+	c.initSensitiveCache() // Ensure cache is initialized
+	if c.sensitiveCache != nil {
+		for _, re := range c.sensitiveCache.regexes {
+			content = re.ReplaceAllString(content, "[FILTERED]")
+		}
+	}
+
+	return content
 }
 
 type HooksConfig struct {
@@ -647,7 +659,8 @@ type ToolDiscoveryConfig struct {
 }
 
 type ToolConfig struct {
-	Enabled bool `json:"enabled" yaml:"-" env:"ENABLED"`
+	Enabled     bool `json:"enabled"      yaml:"-" env:"ENABLED"`
+	StealthMode bool `json:"stealth_mode" yaml:"-" env:"STEALTH_MODE"`
 }
 
 type BraveConfig struct {
@@ -808,6 +821,10 @@ type ReadFileToolConfig struct {
 type ToolsConfig struct {
 	AllowReadPaths  []string `json:"allow_read_paths"  yaml:"-" env:"PICOCLAW_TOOLS_ALLOW_READ_PATHS"`
 	AllowWritePaths []string `json:"allow_write_paths" yaml:"-" env:"PICOCLAW_TOOLS_ALLOW_WRITE_PATHS"`
+	// StealthMode controls whether to suppress technical details (commands, raw output)
+	// from being sent to the communication channels.
+	// Default: false
+	StealthMode bool `json:"stealth_mode" yaml:"-" env:"PICOCLAW_TOOLS_STEALTH_MODE"`
 	// FilterSensitiveData controls whether to filter sensitive values (API keys,
 	// tokens, secrets) from tool results before sending to the LLM.
 	// Default: true (enabled)
@@ -843,6 +860,54 @@ type ToolsConfig struct {
 // IsFilterSensitiveDataEnabled returns true if sensitive data filtering is enabled
 func (c *ToolsConfig) IsFilterSensitiveDataEnabled() bool {
 	return c.FilterSensitiveData
+}
+
+// IsStealthModeEnabled returns true if stealth mode is enabled globally or for
+// the specified tool.
+func (c ToolsConfig) IsStealthModeEnabled(toolName string) bool {
+	if c.StealthMode {
+		return true
+	}
+
+	// Check specific tool configurations
+	switch toolName {
+	case "append_file":
+		return c.AppendFile.StealthMode
+	case "edit_file":
+		return c.EditFile.StealthMode
+	case "exec":
+		return c.Exec.StealthMode
+	case "find_skills":
+		return c.FindSkills.StealthMode
+	case "i2c":
+		return c.I2C.StealthMode
+	case "install_skill":
+		return c.InstallSkill.StealthMode
+	case "list_dir":
+		return c.ListDir.StealthMode
+	case "message":
+		return c.Message.StealthMode
+	case "read_file":
+		return c.ReadFile.Enabled && false // ReadFile structure doesn't have it yet, but handled by global
+	case "send_file":
+		return c.SendFile.StealthMode
+	case "send_tts":
+		return c.SendTTS.StealthMode
+	case "spawn":
+		return c.Spawn.StealthMode
+	case "spawn_status":
+		return c.SpawnStatus.StealthMode
+	case "spi":
+		return c.SPI.StealthMode
+	case "subagent":
+		return c.Subagent.StealthMode
+	case "web_fetch":
+		return c.WebFetch.StealthMode
+	case "write_file":
+		return c.WriteFile.StealthMode
+	}
+
+	return false
 }
 
 // GetFilterMinLength returns the minimum content length for filtering (default: 8)

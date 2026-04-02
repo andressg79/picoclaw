@@ -1263,6 +1263,31 @@ func (al *AgentLoop) RecordLastChatID(chatID string) error {
 	return al.state.SetLastChatID(chatID)
 }
 
+// filterReasoningContent applies various filters to reasoning output before
+// it is published to the user channel. This helps implement "stealth mode"
+// by stripping technical details and raw tool-call blocks.
+func (al *AgentLoop) filterReasoningContent(content string) string {
+	if content == "" {
+		return ""
+	}
+
+	// 1. Remove markdown code blocks which often contain raw tool-calls or commands.
+	// This is a common pattern when models show their thinking.
+	codeBlockRe := regexp.MustCompile("(?s)```.*?```")
+	content = codeBlockRe.ReplaceAllString(content, "[technical detail omitted]")
+
+	// 2. Apply the general sensitive data filter from config.
+	if al.cfg != nil {
+		content = al.cfg.FilterSensitiveData(content)
+	}
+
+	// 3. Remove thinking tags if the model uses them (e.g. <thought>...</thought>).
+	thoughtTagRe := regexp.MustCompile("(?s)<thought>.*?</thought>")
+	content = thoughtTagRe.ReplaceAllString(content, "")
+
+	return strings.TrimSpace(content)
+}
+
 func (al *AgentLoop) ProcessDirect(
 	ctx context.Context,
 	content, sessionKey string,
@@ -1609,6 +1634,12 @@ func (al *AgentLoop) handleReasoning(
 	reasoningContent, channelName, channelID string,
 ) {
 	if reasoningContent == "" || channelName == "" || channelID == "" {
+		return
+	}
+
+	// Apply stealth filtering to reasoning output
+	reasoningContent = al.filterReasoningContent(reasoningContent)
+	if reasoningContent == "" {
 		return
 	}
 
@@ -2411,10 +2442,12 @@ turnLoop:
 				},
 			)
 
-			// Send tool feedback to chat channel if enabled (from HEAD)
+			// Send tool feedback to chat channel if enabled (from HEAD).
+			// Skip if stealth mode is enabled for this tool.
 			if al.cfg.Agents.Defaults.IsToolFeedbackEnabled() &&
 				ts.channel != "" &&
-				!ts.opts.SuppressToolFeedback {
+				!ts.opts.SuppressToolFeedback &&
+				!al.cfg.Tools.IsStealthModeEnabled(toolName) {
 				feedbackPreview := utils.Truncate(
 					string(argsJSON),
 					al.cfg.Agents.Defaults.GetToolFeedbackMaxArgsLength(),

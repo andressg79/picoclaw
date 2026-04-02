@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"strings"
 	"sync"
 
@@ -62,11 +63,23 @@ func saveSecurityConfig(securityPath string, sec *Config) error {
 	return fileutil.WriteFileAtomic(securityPath, buf.Bytes(), 0o600)
 }
 
-// SensitiveDataCache caches the strings.Replacer for filtering sensitive data.
+// SensitiveDataCache caches the strings.Replacer and regex for filtering sensitive data.
 // Computed once on first access via sync.Once.
 type SensitiveDataCache struct {
 	replacer *strings.Replacer
+	regexes  []*regexp.Regexp
 	once     sync.Once
+}
+
+var globalSecretPatterns = []string{
+	// SSH/RSA Private Keys
+	`(?s)-----BEGIN [A-Z ]+ PRIVATE KEY-----.*?-----END [A-Z ]+ PRIVATE KEY-----`,
+	// Bearer Tokens / Authorization headers
+	`(?i)Authorization:\s*Bearer\s+[a-zA-Z0-9\-\._~+/]+=*`,
+	// AWS Access Key ID
+	`AKIA[0-9A-Z]{16}`,
+	// Generic API keys / Secret formats in JSON/YAML
+	`(?i)(api_key|apikey|secret|token|password|passwd|auth_token)\s*[:=]\s*["']?[a-zA-Z0-9\-\._~+/]{16,}["']?`,
 }
 
 // SensitiveDataReplacer returns the strings.Replacer for filtering sensitive data.
@@ -82,6 +95,13 @@ func (sec *Config) initSensitiveCache() {
 		sec.sensitiveCache = &SensitiveDataCache{}
 	}
 	sec.sensitiveCache.once.Do(func() {
+		// Compile global regex patterns
+		for _, p := range globalSecretPatterns {
+			if re, err := regexp.Compile(p); err == nil {
+				sec.sensitiveCache.regexes = append(sec.sensitiveCache.regexes, re)
+			}
+		}
+
 		values := sec.collectSensitiveValues()
 		if len(values) == 0 {
 			sec.sensitiveCache.replacer = strings.NewReplacer()
