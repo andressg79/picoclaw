@@ -485,7 +485,11 @@ func TestGeminiProvider_BuildRequestBody_SetsBothThoughtSignatureFormats(t *test
 		t.Fatalf("request body = %s, expected camelCase thoughtSignature", jsonBody)
 	}
 	if !strings.Contains(jsonBody, `"thought_signature":"sig-1"`) {
-		t.Fatalf("request body = %s, expected snake_case thought_signature for Gemini 3.5 Flash Agentic compatibility", jsonBody)
+		t.Fatalf(
+			"request body = %s, expected snake_case thought_signature for "+
+				"Gemini 3.5 Flash Agentic compatibility",
+			jsonBody,
+		)
 	}
 }
 
