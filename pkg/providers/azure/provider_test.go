@@ -1,7 +1,9 @@
 package azure
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -46,7 +48,7 @@ func TestProviderChat_AzureURLConstruction(t *testing.T) {
 	}))
 	defer server.Close()
 
-	p := NewProvider("test-key", server.URL, "")
+	p := NewProvider("test-key", server.URL, "", "")
 	_, err := p.Chat(t.Context(), []Message{{Role: "user", Content: "hi"}}, nil, "my-gpt5-deployment", nil)
 	if err != nil {
 		t.Fatalf("Chat() error = %v", err)
@@ -69,7 +71,7 @@ func TestProviderChat_AzureAuthHeader(t *testing.T) {
 	}))
 	defer server.Close()
 
-	p := NewProvider("test-azure-key", server.URL, "")
+	p := NewProvider("test-azure-key", server.URL, "", "")
 	_, err := p.Chat(t.Context(), []Message{{Role: "user", Content: "hi"}}, nil, "deployment", nil)
 	if err != nil {
 		t.Fatalf("Chat() error = %v", err)
@@ -92,7 +94,7 @@ func TestProviderChat_AzureRequestBodyContainsModel(t *testing.T) {
 	}))
 	defer server.Close()
 
-	p := NewProvider("test-key", server.URL, "")
+	p := NewProvider("test-key", server.URL, "", "")
 	_, err := p.Chat(t.Context(), []Message{{Role: "user", Content: "hi"}}, nil, "my-deployment", nil)
 	if err != nil {
 		t.Fatalf("Chat() error = %v", err)
@@ -112,7 +114,7 @@ func TestProviderChat_AzureUsesMaxOutputTokens(t *testing.T) {
 	}))
 	defer server.Close()
 
-	p := NewProvider("test-key", server.URL, "")
+	p := NewProvider("test-key", server.URL, "", "")
 	_, err := p.Chat(
 		t.Context(),
 		[]Message{{Role: "user", Content: "hi"}},
@@ -144,7 +146,7 @@ func TestProviderChat_AzureStoreIsFalse(t *testing.T) {
 	}))
 	defer server.Close()
 
-	p := NewProvider("test-key", server.URL, "")
+	p := NewProvider("test-key", server.URL, "", "")
 	_, err := p.Chat(t.Context(), []Message{{Role: "user", Content: "hi"}}, nil, "deployment", nil)
 	if err != nil {
 		t.Fatalf("Chat() error = %v", err)
@@ -161,7 +163,7 @@ func TestProviderChat_AzureHTTPError(t *testing.T) {
 	}))
 	defer server.Close()
 
-	p := NewProvider("bad-key", server.URL, "")
+	p := NewProvider("bad-key", server.URL, "", "")
 	_, err := p.Chat(t.Context(), []Message{{Role: "user", Content: "hi"}}, nil, "deployment", nil)
 	if err == nil {
 		t.Fatal("expected error, got nil")
@@ -176,7 +178,7 @@ func TestProviderChat_AzureRateLimitError(t *testing.T) {
 	}))
 	defer server.Close()
 
-	p := NewProvider("test-key", server.URL, "")
+	p := NewProvider("test-key", server.URL, "", "")
 	_, err := p.Chat(t.Context(), []Message{{Role: "user", Content: "hi"}}, nil, "deployment", nil)
 	if err == nil {
 		t.Fatal("expected error for 429, got nil")
@@ -194,7 +196,7 @@ func TestProviderChat_AzureServerError(t *testing.T) {
 	}))
 	defer server.Close()
 
-	p := NewProvider("test-key", server.URL, "")
+	p := NewProvider("test-key", server.URL, "", "")
 	_, err := p.Chat(t.Context(), []Message{{Role: "user", Content: "hi"}}, nil, "deployment", nil)
 	if err == nil {
 		t.Fatal("expected error for 500, got nil")
@@ -229,7 +231,7 @@ func TestProviderChat_AzureParseTextOutput(t *testing.T) {
 	}))
 	defer server.Close()
 
-	p := NewProvider("test-key", server.URL, "")
+	p := NewProvider("test-key", server.URL, "", "")
 	out, err := p.Chat(t.Context(), []Message{{Role: "user", Content: "hi"}}, nil, "deployment", nil)
 	if err != nil {
 		t.Fatalf("Chat() error = %v", err)
@@ -270,7 +272,7 @@ func TestProviderChat_AzureParseToolCalls(t *testing.T) {
 	}))
 	defer server.Close()
 
-	p := NewProvider("test-key", server.URL, "")
+	p := NewProvider("test-key", server.URL, "", "")
 	out, err := p.Chat(t.Context(), []Message{{Role: "user", Content: "weather?"}}, nil, "deployment", nil)
 	if err != nil {
 		t.Fatalf("Chat() error = %v", err)
@@ -287,7 +289,7 @@ func TestProviderChat_AzureParseToolCalls(t *testing.T) {
 }
 
 func TestProvider_AzureEmptyAPIBase(t *testing.T) {
-	p := NewProvider("test-key", "", "")
+	p := NewProvider("test-key", "", "", "")
 	_, err := p.Chat(t.Context(), []Message{{Role: "user", Content: "hi"}}, nil, "deployment", nil)
 	if err == nil {
 		t.Fatal("expected error for empty API base")
@@ -295,21 +297,21 @@ func TestProvider_AzureEmptyAPIBase(t *testing.T) {
 }
 
 func TestProvider_AzureRequestTimeoutDefault(t *testing.T) {
-	p := NewProvider("test-key", "https://example.com", "")
+	p := NewProvider("test-key", "https://example.com", "", "")
 	if p.httpClient.Timeout != defaultRequestTimeout {
 		t.Errorf("timeout = %v, want %v", p.httpClient.Timeout, defaultRequestTimeout)
 	}
 }
 
 func TestProvider_AzureRequestTimeoutOverride(t *testing.T) {
-	p := NewProvider("test-key", "https://example.com", "", WithRequestTimeout(300*time.Second))
+	p := NewProvider("test-key", "https://example.com", "", "", WithRequestTimeout(300*time.Second))
 	if p.httpClient.Timeout != 300*time.Second {
 		t.Errorf("timeout = %v, want %v", p.httpClient.Timeout, 300*time.Second)
 	}
 }
 
 func TestProvider_AzureNewProviderWithTimeout(t *testing.T) {
-	p := NewProviderWithTimeout("test-key", "https://example.com", "", 180)
+	p := NewProviderWithTimeout("test-key", "https://example.com", "", "", 180)
 	if p.httpClient.Timeout != 180*time.Second {
 		t.Errorf("timeout = %v, want %v", p.httpClient.Timeout, 180*time.Second)
 	}
@@ -343,7 +345,7 @@ func TestProviderChat_AzureNativeWebSearchInjection(t *testing.T) {
 		},
 	}
 
-	p := NewProvider("test-key", server.URL, "")
+	p := NewProvider("test-key", server.URL, "", "")
 
 	// With native_search=true: user-defined web_search should be replaced by built-in
 	_, err := p.Chat(t.Context(), []Message{{Role: "user", Content: "hi"}}, tools, "deployment",
@@ -393,7 +395,7 @@ func TestProviderChat_AzureNoNativeWebSearch(t *testing.T) {
 		},
 	}
 
-	p := NewProvider("test-key", server.URL, "")
+	p := NewProvider("test-key", server.URL, "", "")
 
 	// Without native_search: user-defined web_search should be kept as-is
 	_, err := p.Chat(t.Context(), []Message{{Role: "user", Content: "hi"}}, tools, "deployment", nil)
@@ -413,5 +415,70 @@ func TestProviderChat_AzureNoNativeWebSearch(t *testing.T) {
 	tool, _ := toolsAny[0].(map[string]any)
 	if tool["type"] != "function" {
 		t.Errorf("tool type = %v, want %q", tool["type"], "function")
+	}
+}
+
+func TestProviderChat_AzureTokenSourceHeader(t *testing.T) {
+	var capturedAuth string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedAuth = r.Header.Get("Authorization")
+		writeValidResponse(w)
+	}))
+	defer server.Close()
+
+	ts := func(ctx context.Context) (string, error) {
+		return "fake-entra-token", nil
+	}
+	p := NewProviderWithTokenSource(server.URL, "", "", ts)
+	_, err := p.Chat(t.Context(), []Message{{Role: "user", Content: "hi"}}, nil, "deployment", nil)
+	if err != nil {
+		t.Fatalf("Chat() error = %v", err)
+	}
+	if capturedAuth != "Bearer fake-entra-token" {
+		t.Errorf("Authorization header = %q, want %q", capturedAuth, "Bearer fake-entra-token")
+	}
+}
+
+func TestProviderChat_AzureTokenSourceError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeValidResponse(w)
+	}))
+	defer server.Close()
+
+	wantErr := errors.New("creds gone")
+	ts := func(ctx context.Context) (string, error) {
+		return "", wantErr
+	}
+	p := NewProviderWithTokenSource(server.URL, "", "", ts)
+	_, err := p.Chat(t.Context(), []Message{{Role: "user", Content: "hi"}}, nil, "deployment", nil)
+	if err == nil {
+		t.Fatal("expected error from token source")
+	}
+	if !strings.Contains(err.Error(), "creds gone") {
+		t.Errorf("error %q should wrap original token source error", err.Error())
+	}
+}
+
+func TestProviderChat_AzureTokenSourcePrecedence(t *testing.T) {
+	var capturedAuth string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedAuth = r.Header.Get("Authorization")
+		writeValidResponse(w)
+	}))
+	defer server.Close()
+
+	ts := func(ctx context.Context) (string, error) {
+		return "from-token-source", nil
+	}
+	// Provider with both an api_key AND a token source: token source must win.
+	p := NewProvider("static-api-key", server.URL, "", "", WithTokenSource(ts))
+	_, err := p.Chat(t.Context(), []Message{{Role: "user", Content: "hi"}}, nil, "deployment", nil)
+	if err != nil {
+		t.Fatalf("Chat() error = %v", err)
+	}
+	if capturedAuth != "Bearer from-token-source" {
+		t.Errorf("Authorization header = %q, want token-source value", capturedAuth)
 	}
 }

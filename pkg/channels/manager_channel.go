@@ -4,25 +4,35 @@ import (
 	"crypto/md5"
 	"encoding/hex"
 	"encoding/json"
+	"log"
 
 	"github.com/sipeed/picoclaw/pkg/config"
-	"github.com/sipeed/picoclaw/pkg/logger"
 )
 
 func toChannelHashes(cfg *config.Config) map[string]string {
 	result := make(map[string]string)
 	ch := cfg.Channels
-	// should not be error
-	marshal, _ := json.Marshal(ch)
+	marshal, err := json.Marshal(ch)
+	if err != nil {
+		log.Printf("[manager_channel] failed to marshal channels config: %v", err)
+		return result
+	}
 	var channelConfig map[string]map[string]any
-	_ = json.Unmarshal(marshal, &channelConfig)
+	if err := json.Unmarshal(marshal, &channelConfig); err != nil {
+		log.Printf("[manager_channel] failed to unmarshal channels config: %v", err)
+		return result
+	}
 
 	for key, value := range channelConfig {
-		if !value["enabled"].(bool) {
+		if enabled, ok := value["enabled"].(bool); !ok || !enabled {
 			continue
 		}
-		hiddenValues(key, value, ch)
-		valueBytes, _ := json.Marshal(value)
+		hiddenValues(key, value, ch.Get(key))
+		valueBytes, err := json.Marshal(value)
+		if err != nil {
+			log.Printf("[manager_channel] failed to marshal channel %s config: %v", key, err)
+			continue
+		}
 		hash := md5.Sum(valueBytes)
 		result[key] = hex.EncodeToString(hash[:])
 	}
@@ -30,38 +40,105 @@ func toChannelHashes(cfg *config.Config) map[string]string {
 	return result
 }
 
-func hiddenValues(key string, value map[string]any, ch config.ChannelsConfig) {
+func hiddenValues(key string, value map[string]any, ch *config.Channel) {
+	v, err := ch.GetDecoded()
+	if err != nil {
+		return
+	}
 	switch key {
 	case "pico":
-		value["token"] = ch.Pico.Token.String()
+		if settings, ok := v.(*config.PicoSettings); ok {
+			value["token"] = settings.Token.String()
+		}
 	case "telegram":
-		value["token"] = ch.Telegram.Token.String()
+		if settings, ok := v.(*config.TelegramSettings); ok {
+			value["token"] = settings.Token.String()
+		}
 	case "discord":
-		value["token"] = ch.Discord.Token.String()
+		if settings, ok := v.(*config.DiscordSettings); ok {
+			value["token"] = settings.Token.String()
+		}
 	case "slack":
-		value["bot_token"] = ch.Slack.BotToken.String()
-		value["app_token"] = ch.Slack.AppToken.String()
+		if settings, ok := v.(*config.SlackSettings); ok {
+			value["bot_token"] = settings.BotToken.String()
+			value["app_token"] = settings.AppToken.String()
+		}
 	case "matrix":
-		value["token"] = ch.Matrix.AccessToken.String()
+		if settings, ok := v.(*config.MatrixSettings); ok {
+			value["token"] = settings.AccessToken.String()
+		}
 	case "onebot":
-		value["token"] = ch.OneBot.AccessToken.String()
+		if settings, ok := v.(*config.OneBotSettings); ok {
+			value["token"] = settings.AccessToken.String()
+		}
 	case "line":
-		value["token"] = ch.LINE.ChannelAccessToken.String()
-		value["secret"] = ch.LINE.ChannelSecret.String()
+		if settings, ok := v.(*config.LINESettings); ok {
+			value["token"] = settings.ChannelAccessToken.String()
+			value["secret"] = settings.ChannelSecret.String()
+		}
 	case "wecom":
-		value["secret"] = ch.WeCom.Secret.String()
+		if settings, ok := v.(*config.WeComSettings); ok {
+			value["secret"] = settings.Secret.String()
+		}
 	case "dingtalk":
-		value["secret"] = ch.DingTalk.ClientSecret.String()
+		if settings, ok := v.(*config.DingTalkSettings); ok {
+			value["secret"] = settings.ClientSecret.String()
+		}
 	case "qq":
-		value["secret"] = ch.QQ.AppSecret.String()
+		if settings, ok := v.(*config.QQSettings); ok {
+			value["secret"] = settings.AppSecret.String()
+		}
 	case "irc":
-		value["password"] = ch.IRC.Password.String()
-		value["serv_password"] = ch.IRC.NickServPassword.String()
-		value["sasl_password"] = ch.IRC.SASLPassword.String()
+		if settings, ok := v.(*config.IRCSettings); ok {
+			value["password"] = settings.Password.String()
+			value["serv_password"] = settings.NickServPassword.String()
+			value["sasl_password"] = settings.SASLPassword.String()
+		}
 	case "feishu":
-		value["app_secret"] = ch.Feishu.AppSecret.String()
-		value["encrypt_key"] = ch.Feishu.EncryptKey.String()
-		value["verification_token"] = ch.Feishu.VerificationToken.String()
+		if settings, ok := v.(*config.FeishuSettings); ok {
+			value["app_secret"] = settings.AppSecret.String()
+			value["encrypt_key"] = settings.EncryptKey.String()
+			value["verification_token"] = settings.VerificationToken.String()
+		}
+	case "teams_webhook":
+		// Expose webhook URLs for hash computation (they contain secrets)
+		vv := value["webhooks"]
+		webhooks := make(map[string]string)
+		if vv != nil {
+			if m, ok := vv.(map[string]string); ok {
+				webhooks = m
+			} else if m, ok := vv.(map[string]any); ok {
+				for k, w := range m {
+					if s, ok := w.(string); ok {
+						webhooks[k] = s
+					}
+				}
+			}
+		}
+		if settings, ok := v.(*config.TeamsWebhookSettings); ok {
+			for name, target := range settings.Webhooks {
+				webhooks[name] = target.WebhookURL.String()
+			}
+		}
+		value["webhooks"] = webhooks
+	case "mqtt":
+		if settings, ok := v.(*config.MQTTSettings); ok {
+			value["username"] = settings.Username.String()
+			value["password"] = settings.Password.String()
+		}
+	case "slack_webhook":
+		// Expose webhook URLs for hash computation (they contain secrets)
+		if settings, ok := v.(*config.SlackWebhookSettings); ok {
+			webhooks := make(map[string]any)
+			for name, target := range settings.Webhooks {
+				webhooks[name] = map[string]any{
+					"webhook_url": target.WebhookURL.String(),
+					"username":    target.Username,
+					"icon_emoji":  target.IconEmoji,
+				}
+			}
+			value["webhooks"] = webhooks
+		}
 	}
 }
 
@@ -85,85 +162,13 @@ func compareChannels(old, news map[string]string) (added, removed []string) {
 }
 
 func toChannelConfig(cfg *config.Config, list []string) (*config.ChannelsConfig, error) {
-	result := &config.ChannelsConfig{}
-	ch := cfg.Channels
-	// should not be error
-	marshal, _ := json.Marshal(ch)
-	var channelConfig map[string]map[string]any
-	_ = json.Unmarshal(marshal, &channelConfig)
-	temp := make(map[string]map[string]any, 0)
-
-	for key, value := range channelConfig {
-		found := false
-		for _, s := range list {
-			if key == s {
-				found = true
-				break
-			}
-		}
-		if !found || !value["enabled"].(bool) {
+	result := make(config.ChannelsConfig)
+	for _, name := range list {
+		bc, ok := cfg.Channels[name]
+		if !ok || !bc.Enabled {
 			continue
 		}
-		temp[key] = value
+		result[name] = bc
 	}
-
-	marshal, err := json.Marshal(temp)
-	if err != nil {
-		logger.Errorf("marshal error: %v", err)
-		return nil, err
-	}
-	err = json.Unmarshal(marshal, result)
-	if err != nil {
-		logger.Errorf("unmarshal error: %v", err)
-		return nil, err
-	}
-
-	updateKeys(result, &ch)
-
-	return result, nil
-}
-
-func updateKeys(newcfg, old *config.ChannelsConfig) {
-	if newcfg.Pico.Enabled {
-		newcfg.Pico.Token = old.Pico.Token
-	}
-	if newcfg.Telegram.Enabled {
-		newcfg.Telegram.Token = old.Telegram.Token
-	}
-	if newcfg.Discord.Enabled {
-		newcfg.Discord.Token = old.Discord.Token
-	}
-	if newcfg.Slack.Enabled {
-		newcfg.Slack.BotToken = old.Slack.BotToken
-		newcfg.Slack.AppToken = old.Slack.AppToken
-	}
-	if newcfg.Matrix.Enabled {
-		newcfg.Matrix.AccessToken = old.Matrix.AccessToken
-	}
-	if newcfg.OneBot.Enabled {
-		newcfg.OneBot.AccessToken = old.OneBot.AccessToken
-	}
-	if newcfg.LINE.Enabled {
-		newcfg.LINE.ChannelAccessToken = old.LINE.ChannelAccessToken
-		newcfg.LINE.ChannelSecret = old.LINE.ChannelSecret
-	}
-	if newcfg.WeCom.Enabled {
-		newcfg.WeCom.Secret = old.WeCom.Secret
-	}
-	if newcfg.DingTalk.Enabled {
-		newcfg.DingTalk.ClientSecret = old.DingTalk.ClientSecret
-	}
-	if newcfg.QQ.Enabled {
-		newcfg.QQ.AppSecret = old.QQ.AppSecret
-	}
-	if newcfg.IRC.Enabled {
-		newcfg.IRC.Password = old.IRC.Password
-		newcfg.IRC.NickServPassword = old.IRC.NickServPassword
-		newcfg.IRC.SASLPassword = old.IRC.SASLPassword
-	}
-	if newcfg.Feishu.Enabled {
-		newcfg.Feishu.AppSecret = old.Feishu.AppSecret
-		newcfg.Feishu.EncryptKey = old.Feishu.EncryptKey
-		newcfg.Feishu.VerificationToken = old.Feishu.VerificationToken
-	}
+	return &result, nil
 }

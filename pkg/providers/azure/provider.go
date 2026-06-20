@@ -33,9 +33,11 @@ const (
 // It handles Azure-specific authentication (Bearer token), URL construction
 // (Responses API), and request/response formatting.
 type Provider struct {
-	apiKey     string
-	apiBase    string
-	httpClient *http.Client
+	apiKey      string
+	apiBase     string
+	httpClient  *http.Client
+	userAgent   string
+	tokenSource func(ctx context.Context) (string, error)
 }
 
 // Option configures the Azure Provider.
@@ -50,11 +52,27 @@ func WithRequestTimeout(timeout time.Duration) Option {
 	}
 }
 
+// WithUserAgent sets the User-Agent header for requests.
+func WithUserAgent(userAgent string) Option {
+	return func(p *Provider) {
+		p.userAgent = userAgent
+	}
+}
+
+// WithTokenSource sets a callback that returns a bearer token per request.
+// When set, it takes precedence over the static api key.
+func WithTokenSource(ts func(ctx context.Context) (string, error)) Option {
+	return func(p *Provider) {
+		p.tokenSource = ts
+	}
+}
+
 // NewProvider creates a new Azure OpenAI provider.
-func NewProvider(apiKey, apiBase, proxy string, opts ...Option) *Provider {
+func NewProvider(apiKey, apiBase, proxy, userAgent string, opts ...Option) *Provider {
 	p := &Provider{
 		apiKey:     apiKey,
 		apiBase:    strings.TrimRight(apiBase, "/"),
+		userAgent:  userAgent,
 		httpClient: common.NewHTTPClient(proxy),
 	}
 
@@ -68,11 +86,35 @@ func NewProvider(apiKey, apiBase, proxy string, opts ...Option) *Provider {
 }
 
 // NewProviderWithTimeout creates a new Azure OpenAI provider with a custom request timeout in seconds.
-func NewProviderWithTimeout(apiKey, apiBase, proxy string, requestTimeoutSeconds int) *Provider {
+func NewProviderWithTimeout(apiKey, apiBase, proxy, userAgent string, requestTimeoutSeconds int) *Provider {
 	return NewProvider(
-		apiKey, apiBase, proxy,
+		apiKey, apiBase, proxy, userAgent,
 		WithRequestTimeout(time.Duration(requestTimeoutSeconds)*time.Second),
 	)
+}
+
+// NewProviderWithTokenSource creates a new Azure OpenAI provider that obtains its
+// bearer token from the supplied callback on every request. Used for Entra ID auth
+// where tokens are short-lived and refreshed by the underlying credential.
+func NewProviderWithTokenSource(
+	apiBase, proxy, userAgent string,
+	tokenSource func(ctx context.Context) (string, error),
+	opts ...Option,
+) *Provider {
+	p := &Provider{
+		apiBase:     strings.TrimRight(apiBase, "/"),
+		userAgent:   userAgent,
+		httpClient:  common.NewHTTPClient(proxy),
+		tokenSource: tokenSource,
+	}
+
+	for _, opt := range opts {
+		if opt != nil {
+			opt(p)
+		}
+	}
+
+	return p
 }
 
 // Chat sends a request to the Azure OpenAI Responses API endpoint.
@@ -138,8 +180,18 @@ func (p *Provider) Chat(
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	if p.apiKey != "" {
+	switch {
+	case p.tokenSource != nil:
+		tok, tokErr := p.tokenSource(ctx)
+		if tokErr != nil {
+			return nil, fmt.Errorf("acquiring azure identity token: %w", tokErr)
+		}
+		req.Header.Set("Authorization", "Bearer "+tok)
+	case p.apiKey != "":
 		req.Header.Set("Authorization", "Bearer "+p.apiKey)
+	}
+	if p.userAgent != "" {
+		req.Header.Set("User-Agent", p.userAgent)
 	}
 
 	resp, err := p.httpClient.Do(req)

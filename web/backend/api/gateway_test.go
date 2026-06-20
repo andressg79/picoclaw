@@ -15,8 +15,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/stretchr/testify/require"
-
 	"github.com/sipeed/picoclaw/pkg/auth"
 	"github.com/sipeed/picoclaw/pkg/config"
 	ppid "github.com/sipeed/picoclaw/pkg/pid"
@@ -38,6 +36,36 @@ func startLongRunningProcess(t *testing.T) *exec.Cmd {
 	}
 
 	return cmd
+}
+
+func startGatewayLikeProcess(t *testing.T) *exec.Cmd {
+	t.Helper()
+
+	var cmd *exec.Cmd
+	if runtime.GOOS == "windows" {
+		t.Skip("gateway-like process commandline check is not deterministic on Windows tests")
+	}
+	cmd = exec.Command("sh", "-c", "sleep 30 # picoclaw gateway")
+
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	return cmd
+}
+
+func writeTestPidFile(t *testing.T, data ppid.PidFileData) string {
+	t.Helper()
+
+	path := filepath.Join(globalConfigDir(), ".picoclaw.pid")
+	raw, err := json.MarshalIndent(data, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal pid file: %v", err)
+	}
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatalf("write pid file: %v", err)
+	}
+	return path
 }
 
 func mockGatewayHealthResponse(statusCode, pid int) *http.Response {
@@ -68,12 +96,16 @@ func resetGatewayTestState(t *testing.T) {
 	t.Helper()
 
 	originalHealthGet := gatewayHealthGet
+	originalProcessMatcher := gatewayProcessMatcher
+	originalExecCommand := gatewayExecCommand
 	originalRestartGracePeriod := gatewayRestartGracePeriod
 	originalRestartForceKillWindow := gatewayRestartForceKillWindow
 	originalRestartPollInterval := gatewayRestartPollInterval
 	t.Setenv("PICOCLAW_HOME", t.TempDir())
 	t.Cleanup(func() {
 		gatewayHealthGet = originalHealthGet
+		gatewayProcessMatcher = originalProcessMatcher
+		gatewayExecCommand = originalExecCommand
 		gatewayRestartGracePeriod = originalRestartGracePeriod
 		gatewayRestartForceKillWindow = originalRestartForceKillWindow
 		gatewayRestartPollInterval = originalRestartPollInterval
@@ -89,6 +121,226 @@ func resetGatewayTestState(t *testing.T) {
 	})
 }
 
+func TestPicoGatewayProtocol(t *testing.T) {
+	resetGatewayTestState(t)
+
+	gateway.mu.Lock()
+	gateway.picoToken = "ui-token"
+	gateway.mu.Unlock()
+
+	if got := picoGatewayProtocol(); got != tokenPrefix+"ui-token" {
+		t.Fatalf("picoGatewayProtocol() = %q, want %q", got, tokenPrefix+"ui-token")
+	}
+}
+
+type gatewayStartEnvSnapshot struct {
+	GatewayHost    string `json:"gateway_host"`
+	GatewayHostSet bool   `json:"gateway_host_set"`
+	ConfigPath     string `json:"config_path"`
+}
+
+func TestGatewayStartHelperProcess(t *testing.T) {
+	var envPath string
+	for i, arg := range os.Args {
+		if arg == "--" && i+2 < len(os.Args) && os.Args[i+1] == "gateway-env-helper" {
+			envPath = os.Args[i+2]
+			break
+		}
+	}
+	if envPath == "" {
+		t.Skip("helper process")
+	}
+
+	host, ok := os.LookupEnv(config.EnvGatewayHost)
+	raw, err := json.Marshal(gatewayStartEnvSnapshot{
+		GatewayHost:    host,
+		GatewayHostSet: ok,
+		ConfigPath:     os.Getenv(config.EnvConfig),
+	})
+	if err != nil {
+		_, _ = io.WriteString(os.Stderr, err.Error())
+		os.Exit(2)
+	}
+	if err := os.WriteFile(envPath, raw, 0o600); err != nil {
+		_, _ = io.WriteString(os.Stderr, err.Error())
+		os.Exit(2)
+	}
+	os.Exit(0)
+}
+
+func unsetGatewayStartEnvForTest(t *testing.T, key string) {
+	t.Helper()
+
+	prev, hadPrev := os.LookupEnv(key)
+	if err := os.Unsetenv(key); err != nil {
+		t.Fatalf("Unsetenv(%q) error = %v", key, err)
+	}
+	t.Cleanup(func() {
+		if hadPrev {
+			_ = os.Setenv(key, prev)
+			return
+		}
+		_ = os.Unsetenv(key)
+	})
+}
+
+func newGatewayStartTestHandler(t *testing.T) *Handler {
+	t.Helper()
+	resetGatewayTestState(t)
+
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	cfg := config.DefaultConfig()
+	if err := config.SaveConfig(configPath, cfg); err != nil {
+		t.Fatalf("SaveConfig() error = %v", err)
+	}
+
+	h := NewHandler(configPath)
+	h.SetServerOptions(18800, false, false, nil)
+	return h
+}
+
+func startGatewayAndCaptureEnv(t *testing.T, h *Handler) gatewayStartEnvSnapshot {
+	t.Helper()
+
+	unsetGatewayStartEnvForTest(t, config.EnvGatewayHost)
+
+	envPath := filepath.Join(t.TempDir(), "gateway-child-env.json")
+	gatewayExecCommand = func(_ string, _ ...string) *exec.Cmd {
+		return exec.Command(
+			os.Args[0],
+			"-test.run=TestGatewayStartHelperProcess",
+			"--",
+			"gateway-env-helper",
+			envPath,
+		)
+	}
+
+	pid, err := h.startGatewayLocked("starting", 0)
+	if err != nil {
+		t.Fatalf("startGatewayLocked() error = %v", err)
+	}
+	if pid <= 0 {
+		t.Fatalf("startGatewayLocked() pid = %d, want > 0", pid)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		raw, err := os.ReadFile(envPath)
+		if err == nil {
+			var snapshot gatewayStartEnvSnapshot
+			err = json.Unmarshal(raw, &snapshot)
+			if err != nil {
+				t.Fatalf("Unmarshal(child env) error = %v", err)
+			}
+			return snapshot
+		}
+		if !os.IsNotExist(err) {
+			t.Fatalf("ReadFile(%q) error = %v", envPath, err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for gateway child env snapshot %q", envPath)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func TestStartGatewayLocked_ForwardsLauncherHostOverrideToGatewayEnv(t *testing.T) {
+	h := newGatewayStartTestHandler(t)
+	h.SetServerBindHost("127.0.0.1,::1", true)
+
+	snapshot := startGatewayAndCaptureEnv(t, h)
+	if !snapshot.GatewayHostSet {
+		t.Fatal("gateway host env was not set")
+	}
+	if snapshot.GatewayHost != "127.0.0.1,::1" {
+		t.Fatalf("gateway host env = %q, want %q", snapshot.GatewayHost, "127.0.0.1,::1")
+	}
+	if snapshot.ConfigPath != h.configPath {
+		t.Fatalf("config env = %q, want %q", snapshot.ConfigPath, h.configPath)
+	}
+}
+
+func TestStartGatewayLocked_ForwardsLauncherHostFromEnvironmentToGatewayEnv(t *testing.T) {
+	h := newGatewayStartTestHandler(t)
+	h.SetServerBindHost("::", true)
+
+	snapshot := startGatewayAndCaptureEnv(t, h)
+	if !snapshot.GatewayHostSet {
+		t.Fatal("gateway host env was not set")
+	}
+	if snapshot.GatewayHost != "::" {
+		t.Fatalf("gateway host env = %q, want %q", snapshot.GatewayHost, "::")
+	}
+}
+
+func TestStartGatewayLocked_ForwardsWildcardHostForPublicLauncher(t *testing.T) {
+	h := newGatewayStartTestHandler(t)
+	h.SetServerOptions(18800, true, true, nil)
+
+	snapshot := startGatewayAndCaptureEnv(t, h)
+	if !snapshot.GatewayHostSet {
+		t.Fatal("gateway host env was not set")
+	}
+	if snapshot.GatewayHost != "*" {
+		t.Fatalf("gateway host env = %q, want %q", snapshot.GatewayHost, "*")
+	}
+}
+
+func TestStartGatewayLocked_UsesReloadedConfigForBootSignature(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("sleep command differs on Windows")
+	}
+
+	resetGatewayTestState(t)
+
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	cfg := config.DefaultConfig()
+	delete(cfg.Channels, "pico")
+	if err := config.SaveConfig(configPath, cfg); err != nil {
+		t.Fatalf("SaveConfig() error = %v", err)
+	}
+
+	h := NewHandler(configPath)
+	h.SetServerOptions(18800, false, false, nil)
+	gatewayExecCommand = func(_ string, _ ...string) *exec.Cmd {
+		return exec.Command("sleep", "30")
+	}
+
+	originalSignature := computeConfigSignature(cfg)
+	pid, err := h.startGatewayLocked("starting", 0)
+	if err != nil {
+		t.Fatalf("startGatewayLocked() error = %v", err)
+	}
+	if pid <= 0 {
+		t.Fatalf("startGatewayLocked() pid = %d, want > 0", pid)
+	}
+
+	gateway.mu.Lock()
+	cmd := gateway.cmd
+	bootSignature := gateway.bootConfigSignature
+	gateway.mu.Unlock()
+	t.Cleanup(func() {
+		if cmd != nil && cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		if cmd != nil {
+			_ = cmd.Wait()
+		}
+	})
+
+	updatedCfg, err := config.LoadConfig(configPath)
+	if err != nil {
+		t.Fatalf("LoadConfig() error = %v", err)
+	}
+	expectedSignature := computeConfigSignature(updatedCfg)
+	if expectedSignature == originalSignature {
+		t.Fatal("expected EnsurePicoChannel() to change the config signature during gateway start")
+	}
+	if bootSignature != expectedSignature {
+		t.Fatalf("bootConfigSignature = %q, want %q", bootSignature, expectedSignature)
+	}
+}
+
 func TestGatewayStartReady_NoDefaultModel(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "config.json")
 	h := NewHandler(configPath)
@@ -102,6 +354,143 @@ func TestGatewayStartReady_NoDefaultModel(t *testing.T) {
 	}
 	if reason != "no default model configured" {
 		t.Fatalf("gatewayStartReady() reason = %q, want %q", reason, "no default model configured")
+	}
+}
+
+func TestGatewayStartReady_RejectsASROnlyDefaultModel(t *testing.T) {
+	configPath, cleanup := setupOAuthTestEnv(t)
+	defer cleanup()
+
+	cfg, err := config.LoadConfig(configPath)
+	if err != nil {
+		t.Fatalf("LoadConfig() error = %v", err)
+	}
+	cfg.ModelList = []*config.ModelConfig{{
+		ModelName: "elevenlabs-asr",
+		Provider:  "elevenlabs",
+		Model:     "scribe_v1",
+		APIKeys:   config.SimpleSecureStrings("sk_elevenlabs_test"),
+	}}
+	cfg.Agents.Defaults.ModelName = "elevenlabs-asr"
+
+	err = config.SaveConfig(configPath, cfg)
+	if err != nil {
+		t.Fatalf("SaveConfig() error = %v", err)
+	}
+
+	h := NewHandler(configPath)
+	ready, reason, err := h.gatewayStartReady()
+	if err != nil {
+		t.Fatalf("gatewayStartReady() error = %v", err)
+	}
+	if ready {
+		t.Fatal("gatewayStartReady() ready = true, want false")
+	}
+	if reason != `default model "elevenlabs-asr" is not usable for chat` {
+		t.Fatalf(
+			"gatewayStartReady() reason = %q, want %q",
+			reason,
+			`default model "elevenlabs-asr" is not usable for chat`,
+		)
+	}
+}
+
+func TestLooksLikeGatewayCommandLine(t *testing.T) {
+	cases := []struct {
+		name    string
+		cmdline string
+		want    bool
+	}{
+		{
+			name:    "default picoclaw gateway",
+			cmdline: "/usr/local/bin/picoclaw gateway -E",
+			want:    true,
+		},
+		{
+			name:    "renamed binary with gateway subcommand",
+			cmdline: "/opt/bin/custom-claw gateway -E -d",
+			want:    true,
+		},
+		{
+			name:    "standalone gateway binary path",
+			cmdline: "/opt/bin/gateway -E",
+			want:    true,
+		},
+		{
+			name:    "non gateway process",
+			cmdline: "/bin/sleep 30",
+			want:    false,
+		},
+		{
+			name:    "gateway substring only",
+			cmdline: "/opt/bin/gatewayd --serve",
+			want:    false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := looksLikeGatewayCommandLine(tc.cmdline)
+			if got != tc.want {
+				t.Fatalf("looksLikeGatewayCommandLine(%q) = %v, want %v", tc.cmdline, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestValidateGatewayPidDataAcceptsHealthWhenMatcherInconclusive(t *testing.T) {
+	resetGatewayTestState(t)
+
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	h := NewHandler(configPath)
+
+	const testPID = 34567
+	pidData := &ppid.PidFileData{
+		PID:  testPID,
+		Host: "127.0.0.1",
+		Port: 18790,
+	}
+
+	gatewayProcessMatcher = func(int) (bool, bool) { return false, false }
+	gatewayHealthGet = func(string, time.Duration) (*http.Response, error) {
+		return mockGatewayHealthResponse(http.StatusOK, testPID), nil
+	}
+
+	ok, decisive, reason := h.validateGatewayPidData(pidData, nil)
+	if !ok {
+		t.Fatalf("validateGatewayPidData() ok = false, want true (reason=%q)", reason)
+	}
+	if !decisive {
+		t.Fatalf("validateGatewayPidData() decisive = false, want true")
+	}
+}
+
+func TestValidateGatewayPidDataRejectsHealthPidMismatchWhenMatcherInconclusive(t *testing.T) {
+	resetGatewayTestState(t)
+
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	h := NewHandler(configPath)
+
+	pidData := &ppid.PidFileData{
+		PID:  34567,
+		Host: "127.0.0.1",
+		Port: 18790,
+	}
+
+	gatewayProcessMatcher = func(int) (bool, bool) { return false, false }
+	gatewayHealthGet = func(string, time.Duration) (*http.Response, error) {
+		return mockGatewayHealthResponse(http.StatusOK, 99999), nil
+	}
+
+	ok, decisive, reason := h.validateGatewayPidData(pidData, nil)
+	if ok {
+		t.Fatalf("validateGatewayPidData() ok = true, want false")
+	}
+	if !decisive {
+		t.Fatalf("validateGatewayPidData() decisive = false, want true")
+	}
+	if !strings.Contains(reason, "health pid mismatch") {
+		t.Fatalf("validateGatewayPidData() reason = %q, want contains %q", reason, "health pid mismatch")
 	}
 }
 
@@ -447,7 +836,7 @@ func TestGatewayStatusKeepsRunningWhenHealthProbeFailsAfterRunning(t *testing.T)
 	}
 }
 
-func TestGatewayStatusReportsRunningFromPidProbe(t *testing.T) {
+func TestGatewayStatusKeepsPidDataWhileTrackedProcessAliveWhenPidFileUnavailable(t *testing.T) {
 	resetGatewayTestState(t)
 
 	configPath := filepath.Join(t.TempDir(), "config.json")
@@ -464,6 +853,173 @@ func TestGatewayStatusReportsRunningFromPidProbe(t *testing.T) {
 	})
 
 	gateway.mu.Lock()
+	gateway.cmd = cmd
+	gateway.pidData = &ppid.PidFileData{
+		PID:   cmd.Process.Pid,
+		Token: "existing-token",
+	}
+	setGatewayRuntimeStatusLocked("running")
+	gateway.mu.Unlock()
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/gateway/status", nil)
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+
+	gateway.mu.Lock()
+	defer gateway.mu.Unlock()
+	if gateway.pidData == nil {
+		t.Fatal("gateway.pidData was cleared while runtime status remained running")
+	}
+}
+
+func TestGatewayStatusDowngradesRunningWhenTrackedProcessExitedAndPidFileMissing(t *testing.T) {
+	resetGatewayTestState(t)
+
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	h := NewHandler(configPath)
+	mux := http.NewServeMux()
+	h.RegisterRoutes(mux)
+
+	cmd := startLongRunningProcess(t)
+	if cmd.Process != nil {
+		_ = cmd.Process.Kill()
+	}
+	_ = cmd.Wait()
+
+	gateway.mu.Lock()
+	gateway.cmd = cmd
+	gateway.pidData = &ppid.PidFileData{
+		PID:   cmd.Process.Pid,
+		Token: "stale-token",
+	}
+	setGatewayRuntimeStatusLocked("running")
+	gateway.mu.Unlock()
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/gateway/status", nil)
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if got := body["gateway_status"]; got != "stopped" {
+		t.Fatalf("gateway_status = %#v, want %q", got, "stopped")
+	}
+
+	gateway.mu.Lock()
+	defer gateway.mu.Unlock()
+	if gateway.pidData != nil {
+		t.Fatal("gateway.pidData should be cleared when tracked process has exited")
+	}
+}
+
+func TestGatewayStatusIgnoresAndRemovesPidFileForNonGatewayProcess(t *testing.T) {
+	resetGatewayTestState(t)
+
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	h := NewHandler(configPath)
+	mux := http.NewServeMux()
+	h.RegisterRoutes(mux)
+
+	cmd := startLongRunningProcess(t)
+	t.Cleanup(func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		_ = cmd.Wait()
+	})
+
+	pidPath := writeTestPidFile(t, ppid.PidFileData{
+		PID:   cmd.Process.Pid,
+		Token: "stale-token",
+		Host:  "127.0.0.1",
+		Port:  18790,
+	})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/gateway/status", nil)
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if got := body["gateway_status"]; got != "stopped" {
+		t.Fatalf("gateway_status = %#v, want %q", got, "stopped")
+	}
+	if _, err := os.Stat(pidPath); !os.IsNotExist(err) {
+		t.Fatal("stale pid file should be removed for non-gateway process")
+	}
+}
+
+func TestGatewayStopRefusesNonGatewayAttachedProcess(t *testing.T) {
+	resetGatewayTestState(t)
+	if runtime.GOOS == "windows" {
+		t.Skip("commandline-based process type check is best-effort on Windows")
+	}
+
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	h := NewHandler(configPath)
+	mux := http.NewServeMux()
+	h.RegisterRoutes(mux)
+
+	cmd := startLongRunningProcess(t)
+	t.Cleanup(func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		_ = cmd.Wait()
+	})
+
+	gateway.mu.Lock()
+	gateway.cmd = cmd
+	gateway.owned = false
+	setGatewayRuntimeStatusLocked("running")
+	gateway.mu.Unlock()
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/gateway/stop", nil)
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusInternalServerError)
+	}
+	if !isCmdProcessAliveLocked(cmd) {
+		t.Fatal("non-gateway process should not be terminated by /api/gateway/stop")
+	}
+}
+
+func TestGatewayStatusReportsRunningFromPidProbe(t *testing.T) {
+	resetGatewayTestState(t)
+	gatewayProcessMatcher = func(int) (bool, bool) { return true, true }
+
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	h := NewHandler(configPath)
+	mux := http.NewServeMux()
+	h.RegisterRoutes(mux)
+
+	cmd := startGatewayLikeProcess(t)
+	t.Cleanup(func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		_ = cmd.Wait()
+	})
+
+	gateway.mu.Lock()
 	setGatewayRuntimeStatusLocked("stopped")
 	gateway.mu.Unlock()
 
@@ -471,8 +1027,12 @@ func TestGatewayStatusReportsRunningFromPidProbe(t *testing.T) {
 		return mockGatewayHealthResponse(http.StatusOK, cmd.Process.Pid), nil
 	}
 
-	_, err := ppid.WritePidFile(globalConfigDir(), "localhost", 0)
-	require.NoError(t, err)
+	writeTestPidFile(t, ppid.PidFileData{
+		PID:   cmd.Process.Pid,
+		Token: "test-token",
+		Host:  "127.0.0.1",
+		Port:  18790,
+	})
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/api/gateway/status", nil)
@@ -497,6 +1057,7 @@ func TestGatewayStatusReportsRunningFromPidProbe(t *testing.T) {
 
 func TestGatewayStatusRequiresRestartAfterDefaultModelChange(t *testing.T) {
 	resetGatewayTestState(t)
+	gatewayProcessMatcher = func(int) (bool, bool) { return true, true }
 
 	configPath := filepath.Join(t.TempDir(), "config.json")
 	cfg := config.DefaultConfig()
@@ -515,16 +1076,23 @@ func TestGatewayStatusRequiresRestartAfterDefaultModelChange(t *testing.T) {
 	mux := http.NewServeMux()
 	h.RegisterRoutes(mux)
 
-	process, err := os.FindProcess(os.Getpid())
-	if err != nil {
-		t.Fatalf("FindProcess() error = %v", err)
-	}
-	_, err = ppid.WritePidFile(globalConfigDir(), "localhost", 0)
-	require.NoError(t, err)
+	cmd := startGatewayLikeProcess(t)
+	t.Cleanup(func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		_ = cmd.Wait()
+	})
+	writeTestPidFile(t, ppid.PidFileData{
+		PID:   cmd.Process.Pid,
+		Token: "test-token",
+		Host:  "127.0.0.1",
+		Port:  18790,
+	})
 
 	bootSignature := computeConfigSignature(cfg)
 	gateway.mu.Lock()
-	gateway.cmd = &exec.Cmd{Process: process}
+	gateway.cmd = cmd
 	gateway.bootDefaultModel = cfg.ModelList[0].ModelName
 	gateway.bootConfigSignature = bootSignature
 	setGatewayRuntimeStatusLocked("running")
@@ -604,6 +1172,658 @@ func TestGatewayStatusRequiresRestartAfterToolChange(t *testing.T) {
 		t.Fatalf("LoadConfig() error = %v", err)
 	}
 	updatedCfg.Tools.WriteFile.Enabled = false
+	if err := config.SaveConfig(configPath, updatedCfg); err != nil {
+		t.Fatalf("SaveConfig() error = %v", err)
+	}
+
+	gatewayHealthGet = func(string, time.Duration) (*http.Response, error) {
+		return mockGatewayHealthResponse(http.StatusOK, os.Getpid()), nil
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/gateway/status", nil)
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+
+	if got := body["gateway_status"]; got != "running" {
+		t.Fatalf("gateway_status = %#v, want %q", got, "running")
+	}
+	if got := body["gateway_restart_required"]; got != true {
+		t.Fatalf("gateway_restart_required = %#v, want true", got)
+	}
+}
+
+func TestGatewayStatusRequiresRestartAfterChannelChange(t *testing.T) {
+	resetGatewayTestState(t)
+
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	cfg := config.DefaultConfig()
+	cfg.Agents.Defaults.ModelName = cfg.ModelList[0].ModelName
+	cfg.ModelList[0].SetAPIKey("test-key")
+	if err := config.SaveConfig(configPath, cfg); err != nil {
+		t.Fatalf("SaveConfig() error = %v", err)
+	}
+
+	h := NewHandler(configPath)
+	mux := http.NewServeMux()
+	h.RegisterRoutes(mux)
+
+	process, err := os.FindProcess(os.Getpid())
+	if err != nil {
+		t.Fatalf("FindProcess() error = %v", err)
+	}
+
+	bootSignature := computeConfigSignature(cfg)
+	gateway.mu.Lock()
+	gateway.cmd = &exec.Cmd{Process: process}
+	gateway.bootDefaultModel = cfg.ModelList[0].ModelName
+	gateway.bootConfigSignature = bootSignature
+	setGatewayRuntimeStatusLocked("running")
+	gateway.mu.Unlock()
+
+	updatedCfg, err := config.LoadConfig(configPath)
+	if err != nil {
+		t.Fatalf("LoadConfig() error = %v", err)
+	}
+	telegram := updatedCfg.Channels.Get("telegram")
+	if telegram == nil {
+		t.Fatalf("expected default telegram channel config")
+	}
+	telegram.Enabled = !telegram.Enabled
+	if err := config.SaveConfig(configPath, updatedCfg); err != nil {
+		t.Fatalf("SaveConfig() error = %v", err)
+	}
+
+	gatewayHealthGet = func(string, time.Duration) (*http.Response, error) {
+		return mockGatewayHealthResponse(http.StatusOK, os.Getpid()), nil
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/gateway/status", nil)
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+
+	if got := body["gateway_status"]; got != "running" {
+		t.Fatalf("gateway_status = %#v, want %q", got, "running")
+	}
+	if got := body["gateway_restart_required"]; got != true {
+		t.Fatalf("gateway_restart_required = %#v, want true", got)
+	}
+}
+
+func TestGatewayStatusRequiresRestartAfterDefaultModelStreamingChange(t *testing.T) {
+	resetGatewayTestState(t)
+
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	cfg := config.DefaultConfig()
+	cfg.Agents.Defaults.ModelName = cfg.ModelList[0].ModelName
+	cfg.ModelList[0].SetAPIKey("test-key")
+	cfg.ModelList[0].Streaming = config.ModelStreamingConfig{Enabled: false}
+	if err := config.SaveConfig(configPath, cfg); err != nil {
+		t.Fatalf("SaveConfig() error = %v", err)
+	}
+
+	h := NewHandler(configPath)
+	mux := http.NewServeMux()
+	h.RegisterRoutes(mux)
+
+	process, err := os.FindProcess(os.Getpid())
+	if err != nil {
+		t.Fatalf("FindProcess() error = %v", err)
+	}
+
+	bootSignature := computeConfigSignature(cfg)
+	gateway.mu.Lock()
+	gateway.cmd = &exec.Cmd{Process: process}
+	gateway.bootDefaultModel = cfg.ModelList[0].ModelName
+	gateway.bootConfigSignature = bootSignature
+	setGatewayRuntimeStatusLocked("running")
+	gateway.mu.Unlock()
+
+	updatedCfg, err := config.LoadConfig(configPath)
+	if err != nil {
+		t.Fatalf("LoadConfig() error = %v", err)
+	}
+	updatedCfg.ModelList[0].Streaming = config.ModelStreamingConfig{Enabled: true}
+	if err := config.SaveConfig(configPath, updatedCfg); err != nil {
+		t.Fatalf("SaveConfig() error = %v", err)
+	}
+
+	gatewayHealthGet = func(string, time.Duration) (*http.Response, error) {
+		return mockGatewayHealthResponse(http.StatusOK, os.Getpid()), nil
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/gateway/status", nil)
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+
+	if got := body["gateway_status"]; got != "running" {
+		t.Fatalf("gateway_status = %#v, want %q", got, "running")
+	}
+	if got := body["gateway_restart_required"]; got != true {
+		t.Fatalf("gateway_restart_required = %#v, want true", got)
+	}
+}
+
+func TestConfigSignatureIncludesModelStreamingForDefaultModelRef(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.ModelList[0].ModelName = "friendly-alias"
+	cfg.ModelList[0].Provider = ""
+	cfg.ModelList[0].Model = "openai/gpt-4o-ref"
+	cfg.Agents.Defaults.ModelName = "openai/gpt-4o-ref"
+	cfg.ModelList[0].Streaming = config.ModelStreamingConfig{Enabled: false}
+
+	before := computeConfigSignature(cfg)
+
+	cfg.ModelList[0].Streaming = config.ModelStreamingConfig{Enabled: true}
+	after := computeConfigSignature(cfg)
+
+	if before == after {
+		t.Fatal("config signature should change when streaming changes for a default model referenced by model ref")
+	}
+}
+
+func TestConfigSignatureIncludesModelStreamingForLoadBalancedAliasEntries(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.ModelList = []*config.ModelConfig{
+		{
+			ModelName: "lb-alias",
+			Model:     "openai/gpt-4o-primary",
+			Streaming: config.ModelStreamingConfig{Enabled: false},
+		},
+		{
+			ModelName: "lb-alias",
+			Model:     "openai/gpt-4o-secondary",
+			Streaming: config.ModelStreamingConfig{Enabled: false},
+		},
+	}
+	cfg.Agents.Defaults.ModelName = "lb-alias"
+
+	before := computeConfigSignature(cfg)
+
+	cfg.ModelList[1].Streaming = config.ModelStreamingConfig{Enabled: true}
+	after := computeConfigSignature(cfg)
+
+	if before == after {
+		t.Fatal("config signature should change when streaming changes for a load-balanced alias entry")
+	}
+}
+
+func TestConfigSignatureIncludesSlashModelIDForDefaultProvider(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.ModelList = []*config.ModelConfig{
+		{
+			ModelName: "nvidia-model",
+			Provider:  "nvidia",
+			Model:     "z-ai/glm-5.1",
+			Streaming: config.ModelStreamingConfig{Enabled: false},
+		},
+	}
+	cfg.Agents.Defaults.Provider = "nvidia"
+	cfg.Agents.Defaults.ModelName = "z-ai/glm-5.1"
+
+	before := computeConfigSignature(cfg)
+
+	cfg.ModelList[0].Streaming = config.ModelStreamingConfig{Enabled: true}
+	after := computeConfigSignature(cfg)
+
+	if before == after {
+		t.Fatal(
+			"config signature should change when streaming changes for a slash-containing model id on the default provider",
+		)
+	}
+}
+
+func TestConfigSignatureIncludesSupportedPrefixSlashModelIDForDefaultProvider(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.ModelList = []*config.ModelConfig{
+		{
+			ModelName: "openrouter-openai",
+			Provider:  "openrouter",
+			Model:     "openai/gpt-4o",
+			Streaming: config.ModelStreamingConfig{Enabled: false},
+		},
+	}
+	cfg.Agents.Defaults.Provider = "openrouter"
+	cfg.Agents.Defaults.ModelName = "openai/gpt-4o"
+
+	before := computeConfigSignature(cfg)
+
+	cfg.ModelList[0].Streaming = config.ModelStreamingConfig{Enabled: true}
+	after := computeConfigSignature(cfg)
+
+	if before == after {
+		t.Fatal(
+			"config signature should change when streaming changes for a supported-prefix slash model id on the default provider",
+		)
+	}
+}
+
+func TestConfigSignatureIncludesLegacyDefaultProviderPrefixedSlashModelID(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.ModelList = []*config.ModelConfig{
+		{
+			ModelName: "legacy-openrouter-openai",
+			Model:     "openrouter/openai/gpt-4o",
+			Streaming: config.ModelStreamingConfig{Enabled: false},
+		},
+	}
+	cfg.Agents.Defaults.Provider = "openrouter"
+	cfg.Agents.Defaults.ModelName = "openai/gpt-4o"
+
+	before := computeConfigSignature(cfg)
+
+	cfg.ModelList[0].Streaming = config.ModelStreamingConfig{Enabled: true}
+	after := computeConfigSignature(cfg)
+
+	if before == after {
+		t.Fatal(
+			"config signature should change when streaming changes for a legacy default-provider prefixed slash model id",
+		)
+	}
+}
+
+func TestConfigSignatureIncludesSlashModelIDWithoutProviderFieldForDefaultProvider(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.ModelList = []*config.ModelConfig{
+		{
+			ModelName: "nvidia-model",
+			Model:     "z-ai/glm-5.1",
+			Streaming: config.ModelStreamingConfig{Enabled: false},
+		},
+	}
+	cfg.Agents.Defaults.Provider = "nvidia"
+	cfg.Agents.Defaults.ModelName = "z-ai/glm-5.1"
+
+	before := computeConfigSignature(cfg)
+
+	cfg.ModelList[0].Streaming = config.ModelStreamingConfig{Enabled: true}
+	after := computeConfigSignature(cfg)
+
+	if before == after {
+		t.Fatal(
+			"config signature should change when streaming changes for a default-provider slash model id without provider field",
+		)
+	}
+}
+
+func TestConfigSignatureIncludesUnknownSlashPrefixModelIDWithoutProviderFieldForDefaultProvider(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.ModelList = []*config.ModelConfig{
+		{
+			ModelName: "nvidia-meta",
+			Model:     "meta/llama-3.1-8b",
+			Streaming: config.ModelStreamingConfig{Enabled: false},
+		},
+	}
+	cfg.Agents.Defaults.Provider = "nvidia"
+	cfg.Agents.Defaults.ModelName = "meta/llama-3.1-8b"
+
+	before := computeConfigSignature(cfg)
+
+	cfg.ModelList[0].Streaming = config.ModelStreamingConfig{Enabled: true}
+	after := computeConfigSignature(cfg)
+
+	if before == after {
+		t.Fatal(
+			"config signature should change when streaming changes for unknown-prefix default-provider slash model id",
+		)
+	}
+}
+
+func TestConfigSignatureDashAliasSlashModelIDMatchesProviderAlias(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.ModelList = []*config.ModelConfig{
+		{
+			ModelName: "zai-model",
+			Provider:  "zai",
+			Model:     "glm-5.1",
+			Streaming: config.ModelStreamingConfig{Enabled: false},
+		},
+	}
+	cfg.Agents.Defaults.Provider = "nvidia"
+	cfg.Agents.Defaults.ModelName = "z-ai/glm-5.1"
+
+	before := computeConfigSignature(cfg)
+
+	cfg.ModelList[0].Streaming = config.ModelStreamingConfig{Enabled: true}
+	after := computeConfigSignature(cfg)
+
+	if before == after {
+		t.Fatal("config signature should change when a dash-alias slash ref matches a provider alias")
+	}
+}
+
+func TestConfigSignatureDashAliasSlashModelIDMatchesProviderAliasWithOpenAIDefault(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.ModelList = []*config.ModelConfig{
+		{
+			ModelName: "zai-model",
+			Provider:  "zai",
+			Model:     "glm-5.1",
+			Streaming: config.ModelStreamingConfig{Enabled: false},
+		},
+	}
+	cfg.Agents.Defaults.Provider = "openai"
+	cfg.Agents.Defaults.ModelName = "z-ai/glm-5.1"
+
+	before := computeConfigSignature(cfg)
+
+	cfg.ModelList[0].Streaming = config.ModelStreamingConfig{Enabled: true}
+	after := computeConfigSignature(cfg)
+
+	if before == after {
+		t.Fatal(
+			"config signature should change when a dash-alias slash ref matches a provider alias with OpenAI default",
+		)
+	}
+}
+
+func TestConfigSignatureProviderAliasRefIgnoresDefaultProvider(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.ModelList = []*config.ModelConfig{
+		{
+			ModelName: "openai-gpt",
+			Provider:  "openai",
+			Model:     "gpt-4o",
+			Streaming: config.ModelStreamingConfig{Enabled: false},
+		},
+	}
+	cfg.Agents.Defaults.Provider = "nvidia"
+	cfg.Agents.Defaults.ModelName = "gpt/gpt-4o"
+
+	before := computeConfigSignature(cfg)
+
+	cfg.ModelList[0].Streaming = config.ModelStreamingConfig{Enabled: true}
+	after := computeConfigSignature(cfg)
+
+	if before == after {
+		t.Fatal("config signature should change for a provider alias ref even when default provider differs")
+	}
+}
+
+func TestConfigSignatureExplicitProviderRefIgnoresDefaultProvider(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.ModelList = []*config.ModelConfig{
+		{
+			ModelName: "openai-gpt",
+			Provider:  "openai",
+			Model:     "gpt-4o",
+			Streaming: config.ModelStreamingConfig{Enabled: false},
+		},
+	}
+	cfg.Agents.Defaults.Provider = "nvidia"
+	cfg.Agents.Defaults.ModelName = "openai/gpt-4o"
+
+	before := computeConfigSignature(cfg)
+
+	cfg.ModelList[0].Streaming = config.ModelStreamingConfig{Enabled: true}
+	after := computeConfigSignature(cfg)
+
+	if before == after {
+		t.Fatal("config signature should change for an explicit provider ref even when default provider differs")
+	}
+}
+
+func TestConfigSignatureExactModelNameTakesPrecedenceOverResolvedRefs(t *testing.T) {
+	tests := []struct {
+		name                  string
+		defaultProvider       string
+		defaultModelName      string
+		models                []*config.ModelConfig
+		shadowedEntryIndex    int
+		exactModelNameIndex   int
+		shadowedChangeMessage string
+		exactChangeMessage    string
+	}{
+		{
+			name:             "slash model name shadows explicit provider ref",
+			defaultProvider:  "nvidia",
+			defaultModelName: "openai/gpt-4o",
+			models: []*config.ModelConfig{
+				{
+					ModelName: "openai/gpt-4o",
+					Provider:  "nvidia",
+					Model:     "openai/gpt-4o",
+					Streaming: config.ModelStreamingConfig{Enabled: false},
+				},
+				{
+					ModelName: "openai-gpt",
+					Provider:  "openai",
+					Model:     "gpt-4o",
+					Streaming: config.ModelStreamingConfig{Enabled: false},
+				},
+			},
+			shadowedEntryIndex:    1,
+			exactModelNameIndex:   0,
+			shadowedChangeMessage: "config signature should not change when an exact slash model_name shadows an explicit provider ref",
+			exactChangeMessage:    "config signature should change when the exact slash model_name entry changes",
+		},
+		{
+			name:             "bare model name shadows default provider model id",
+			defaultProvider:  "openai",
+			defaultModelName: "gpt-4o",
+			models: []*config.ModelConfig{
+				{
+					ModelName: "gpt-4o",
+					Provider:  "anthropic",
+					Model:     "claude-sonnet",
+					Streaming: config.ModelStreamingConfig{Enabled: false},
+				},
+				{
+					ModelName: "openai-gpt",
+					Provider:  "openai",
+					Model:     "gpt-4o",
+					Streaming: config.ModelStreamingConfig{Enabled: false},
+				},
+			},
+			shadowedEntryIndex:    1,
+			exactModelNameIndex:   0,
+			shadowedChangeMessage: "config signature should not change when an exact bare model_name shadows a default-provider model id",
+			exactChangeMessage:    "config signature should change when the exact bare model_name entry changes",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := config.DefaultConfig()
+			cfg.ModelList = tt.models
+			cfg.Agents.Defaults.Provider = tt.defaultProvider
+			cfg.Agents.Defaults.ModelName = tt.defaultModelName
+
+			before := computeConfigSignature(cfg)
+
+			cfg.ModelList[tt.shadowedEntryIndex].Streaming = config.ModelStreamingConfig{Enabled: true}
+			afterShadowedChange := computeConfigSignature(cfg)
+
+			if before != afterShadowedChange {
+				t.Fatal(tt.shadowedChangeMessage)
+			}
+
+			cfg.ModelList[tt.exactModelNameIndex].Streaming = config.ModelStreamingConfig{Enabled: true}
+			afterExactModelNameChange := computeConfigSignature(cfg)
+
+			if before == afterExactModelNameChange {
+				t.Fatal(tt.exactChangeMessage)
+			}
+		})
+	}
+}
+
+func TestConfigSignatureIncludesLoadBalancedDuplicateEntryIndex(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.ModelList = []*config.ModelConfig{
+		{
+			ModelName: "lb-alias",
+			Provider:  "openai",
+			Model:     "gpt-4o",
+			Streaming: config.ModelStreamingConfig{Enabled: false},
+		},
+		{
+			ModelName: "lb-alias",
+			Provider:  "openai",
+			Model:     "gpt-4o",
+			Streaming: config.ModelStreamingConfig{Enabled: true},
+		},
+	}
+	cfg.Agents.Defaults.ModelName = "lb-alias"
+
+	before := computeConfigSignature(cfg)
+
+	cfg.ModelList[0].Streaming.Enabled = true
+	cfg.ModelList[1].Streaming.Enabled = false
+	after := computeConfigSignature(cfg)
+
+	if before == after {
+		t.Fatal("config signature should change when duplicate load-balanced entries swap streaming state")
+	}
+}
+
+func TestConfigSignatureProviderDotAliasRefIgnoresDefaultProvider(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.ModelList = []*config.ModelConfig{
+		{
+			ModelName: "zai-model",
+			Provider:  "zai",
+			Model:     "glm-5.1",
+			Streaming: config.ModelStreamingConfig{Enabled: false},
+		},
+	}
+	cfg.Agents.Defaults.Provider = "nvidia"
+	cfg.Agents.Defaults.ModelName = "z.ai/glm-5.1"
+
+	before := computeConfigSignature(cfg)
+
+	cfg.ModelList[0].Streaming = config.ModelStreamingConfig{Enabled: true}
+	after := computeConfigSignature(cfg)
+
+	if before == after {
+		t.Fatal(
+			"config signature should change for an explicit dot-alias provider ref even when default provider differs",
+		)
+	}
+}
+
+func TestConfigSignatureIncludesDefaultProviderPrefixedRefWithSplitConfig(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.ModelList = []*config.ModelConfig{
+		{
+			ModelName: "openai-split",
+			Provider:  "openai",
+			Model:     "gpt-4o",
+			Streaming: config.ModelStreamingConfig{Enabled: false},
+		},
+	}
+	cfg.Agents.Defaults.Provider = "openai"
+	cfg.Agents.Defaults.ModelName = "openai/gpt-4o"
+
+	before := computeConfigSignature(cfg)
+
+	cfg.ModelList[0].Streaming = config.ModelStreamingConfig{Enabled: true}
+	after := computeConfigSignature(cfg)
+
+	if before == after {
+		t.Fatal(
+			"config signature should change when streaming changes for default-provider prefixed ref with split config",
+		)
+	}
+}
+
+func TestConfigSignatureBareModelRefUsesExactModelBeforeDefaultProviderModelID(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.ModelList = []*config.ModelConfig{
+		{
+			ModelName: "azure-alias",
+			Provider:  "azure",
+			Model:     "gpt-4o",
+			Streaming: config.ModelStreamingConfig{Enabled: false},
+		},
+		{
+			ModelName: "openai-alias",
+			Model:     "openai/gpt-4o",
+			Streaming: config.ModelStreamingConfig{Enabled: false},
+		},
+	}
+	cfg.Agents.Defaults.Provider = "openai"
+	cfg.Agents.Defaults.ModelName = "gpt-4o"
+
+	before := computeConfigSignature(cfg)
+
+	cfg.ModelList[0].Streaming = config.ModelStreamingConfig{Enabled: true}
+	afterExactModelChange := computeConfigSignature(cfg)
+
+	if before == afterExactModelChange {
+		t.Fatal("config signature should change when the exact bare model entry changes streaming")
+	}
+
+	cfg.ModelList[1].Streaming = config.ModelStreamingConfig{Enabled: true}
+	afterDefaultProviderModelChange := computeConfigSignature(cfg)
+
+	if afterExactModelChange != afterDefaultProviderModelChange {
+		t.Fatal("config signature should not change when a shadowed default-provider model id changes streaming")
+	}
+}
+
+func TestGatewayStatusRequiresRestartAfterWebSearchConfigChange(t *testing.T) {
+	resetGatewayTestState(t)
+
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	cfg := config.DefaultConfig()
+	cfg.Agents.Defaults.ModelName = cfg.ModelList[0].ModelName
+	cfg.ModelList[0].SetAPIKey("test-key")
+	cfg.Tools.Web.Enabled = true
+	cfg.Tools.Web.Provider = "sogou"
+	if err := config.SaveConfig(configPath, cfg); err != nil {
+		t.Fatalf("SaveConfig() error = %v", err)
+	}
+
+	h := NewHandler(configPath)
+	mux := http.NewServeMux()
+	h.RegisterRoutes(mux)
+
+	process, err := os.FindProcess(os.Getpid())
+	if err != nil {
+		t.Fatalf("FindProcess() error = %v", err)
+	}
+
+	bootSignature := computeConfigSignature(cfg)
+	gateway.mu.Lock()
+	gateway.cmd = &exec.Cmd{Process: process}
+	gateway.bootDefaultModel = cfg.ModelList[0].ModelName
+	gateway.bootConfigSignature = bootSignature
+	setGatewayRuntimeStatusLocked("running")
+	gateway.mu.Unlock()
+
+	updatedCfg, err := config.LoadConfig(configPath)
+	if err != nil {
+		t.Fatalf("LoadConfig() error = %v", err)
+	}
+	updatedCfg.Tools.Web.Provider = "duckduckgo"
 	if err := config.SaveConfig(configPath, updatedCfg); err != nil {
 		t.Fatalf("SaveConfig() error = %v", err)
 	}

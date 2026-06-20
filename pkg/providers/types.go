@@ -11,6 +11,7 @@ type (
 	ToolCall               = protocoltypes.ToolCall
 	FunctionCall           = protocoltypes.FunctionCall
 	LLMResponse            = protocoltypes.LLMResponse
+	StreamChunk            = protocoltypes.StreamChunk
 	UsageInfo              = protocoltypes.UsageInfo
 	Message                = protocoltypes.Message
 	ToolDefinition         = protocoltypes.ToolDefinition
@@ -19,6 +20,7 @@ type (
 	GoogleExtra            = protocoltypes.GoogleExtra
 	ContentBlock           = protocoltypes.ContentBlock
 	CacheControl           = protocoltypes.CacheControl
+	Attachment             = protocoltypes.Attachment
 )
 
 type LLMProvider interface {
@@ -51,6 +53,17 @@ type StreamingProvider interface {
 	) (*LLMResponse, error)
 }
 
+type StreamingEventProvider interface {
+	ChatStreamEvents(
+		ctx context.Context,
+		messages []Message,
+		tools []ToolDefinition,
+		model string,
+		options map[string]any,
+		onChunk func(StreamChunk),
+	) (*LLMResponse, error)
+}
+
 // ThinkingCapable is an optional interface for providers that support
 // extended thinking (e.g. Anthropic). Used by the agent loop to warn
 // when thinking_level is configured but the active provider cannot use it.
@@ -74,6 +87,7 @@ const (
 	FailoverAuth            FailoverReason = "auth"
 	FailoverRateLimit       FailoverReason = "rate_limit"
 	FailoverBilling         FailoverReason = "billing"
+	FailoverNetwork         FailoverReason = "network"
 	FailoverTimeout         FailoverReason = "timeout"
 	FailoverFormat          FailoverReason = "format"
 	FailoverContextOverflow FailoverReason = "context_overflow"

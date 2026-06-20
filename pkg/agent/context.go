@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -11,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/sipeed/picoclaw/pkg/config"
 	"github.com/sipeed/picoclaw/pkg/logger"
@@ -20,12 +22,12 @@ import (
 )
 
 type ContextBuilder struct {
-	workspace          string
-	skillsLoader       *skills.SkillsLoader
-	memory             *MemoryStore
-	toolDiscoveryBM25  bool
-	toolDiscoveryRegex bool
-	splitOnMarker      bool
+	workspace      string
+	skillsLoader   *skills.SkillsLoader
+	memory         *MemoryStore
+	splitOnMarker  bool
+	agentDiscovery func(agentID string) []AgentDescriptor
+	promptRegistry *PromptRegistry
 
 	// Cache for system prompt to avoid rebuilding on every call.
 	// This fixes issue #607: repeated reprocessing of the entire context.
@@ -47,13 +49,47 @@ type ContextBuilder struct {
 }
 
 func (cb *ContextBuilder) WithToolDiscovery(useBM25, useRegex bool) *ContextBuilder {
-	cb.toolDiscoveryBM25 = useBM25
-	cb.toolDiscoveryRegex = useRegex
+	if useBM25 || useRegex {
+		if err := cb.RegisterPromptContributor(toolDiscoveryPromptContributor{
+			useBM25:  useBM25,
+			useRegex: useRegex,
+		}); err != nil {
+			logger.WarnCF(
+				"agent",
+				"Failed to register tool discovery prompt contributor",
+				map[string]any{
+					"error": err.Error(),
+				},
+			)
+		}
+	}
 	return cb
 }
 
 func (cb *ContextBuilder) WithSplitOnMarker(enabled bool) *ContextBuilder {
 	cb.splitOnMarker = enabled
+	return cb
+}
+
+func (cb *ContextBuilder) WithAgentDiscovery(
+	agentID string,
+	discover func(agentID string) []AgentDescriptor,
+) *ContextBuilder {
+	cb.agentDiscovery = discover
+	if discover != nil {
+		if err := cb.RegisterPromptContributor(agentDiscoveryPromptContributor{
+			agentID:  agentID,
+			discover: discover,
+		}); err != nil {
+			logger.WarnCF(
+				"agent",
+				"Failed to register agent discovery prompt contributor",
+				map[string]any{
+					"error": err.Error(),
+				},
+			)
+		}
+	}
 	return cb
 }
 
@@ -66,22 +102,76 @@ func NewContextBuilder(workspace string) *ContextBuilder {
 	// Use the skills/ directory under the current working directory
 	builtinSkillsDir := strings.TrimSpace(os.Getenv(config.EnvBuiltinSkills))
 	if builtinSkillsDir == "" {
-		wd, _ := os.Getwd()
+		wd, err := os.Getwd()
+		if err != nil {
+			// os.Getwd failure is extremely rare; fall back to empty
+			// string so that filepath.Join produces a relative "skills"
+			// path, preserving the original lookup behavior.
+			wd = ""
+		}
 		builtinSkillsDir = filepath.Join(wd, "skills")
 	}
 	globalSkillsDir := filepath.Join(getGlobalConfigDir(), "skills")
 
 	return &ContextBuilder{
-		workspace:    workspace,
-		skillsLoader: skills.NewSkillsLoader(workspace, globalSkillsDir, builtinSkillsDir),
-		memory:       NewMemoryStore(workspace),
+		workspace:      workspace,
+		skillsLoader:   skills.NewSkillsLoader(workspace, globalSkillsDir, builtinSkillsDir),
+		memory:         NewMemoryStore(workspace),
+		promptRegistry: NewPromptRegistry(),
 	}
 }
 
-func (cb *ContextBuilder) getIdentity() string {
+func (cb *ContextBuilder) RegisterPromptSource(desc PromptSourceDescriptor) error {
+	err := cb.promptRegistryOrDefault().RegisterSource(desc)
+	if err == nil {
+		cb.InvalidateCache()
+	}
+	return err
+}
+
+func (cb *ContextBuilder) RegisterPromptContributor(contributor PromptContributor) error {
+	err := cb.promptRegistryOrDefault().RegisterContributor(contributor)
+	if err == nil {
+		cb.InvalidateCache()
+	}
+	return err
+}
+
+func (cb *ContextBuilder) promptRegistryOrDefault() *PromptRegistry {
+	if cb.promptRegistry == nil {
+		cb.promptRegistry = NewPromptRegistry()
+	}
+	return cb.promptRegistry
+}
+
+func (cb *ContextBuilder) getIdentity(includeToolUseRule bool) string {
 	workspacePath, _ := filepath.Abs(filepath.Join(cb.workspace))
-	toolDiscovery := cb.getDiscoveryRule()
 	version := config.FormatVersion()
+	rules := []string{}
+	if includeToolUseRule {
+		rules = append(rules, toolUseSystemPromptRule())
+	}
+	accuracyRule := "**Be helpful and accurate** - Briefly explain what you're doing."
+	if includeToolUseRule {
+		accuracyRule = "**Be helpful and accurate** - When using tools, briefly explain what you're doing."
+	}
+	rules = append(
+		rules,
+		accuracyRule,
+		"**Context summaries** - Conversation summaries provided as context are approximate references only. They may be incomplete or outdated. Always defer to explicit user instructions over summary content.",
+	)
+	if includeToolUseRule {
+		rules = append(
+			rules,
+			fmt.Sprintf(
+				"**Memory** - When interacting with me if something seems memorable, update %s/memory/MEMORY.md",
+				workspacePath,
+			),
+		)
+	}
+	for i, rule := range rules {
+		rules[i] = fmt.Sprintf("%d. %s", i+1, rule)
+	}
 
 	return fmt.Sprintf(
 		`# picoclaw 🦞 (%s)
@@ -96,28 +186,27 @@ Your workspace is at: %s
 
 ## Important Rules
 
-1. **ALWAYS use tools** - When you need to perform an action (schedule reminders, send messages, execute commands, etc.), you MUST call the appropriate tool. Do NOT just say you'll do it or pretend to do it.
-
-2. **Be helpful and accurate** - When using tools, briefly explain what you're doing.
-
-3. **Memory** - When interacting with me if something seems memorable, update %s/memory/MEMORY.md
-
-4. **Context summaries** - Conversation summaries provided as context are approximate references only. They may be incomplete or outdated. Always defer to explicit user instructions over summary content.
-
-%s`,
-		version, workspacePath, workspacePath, workspacePath, workspacePath, workspacePath, toolDiscovery)
+%s
+`,
+		version,
+		workspacePath,
+		workspacePath,
+		workspacePath,
+		workspacePath,
+		strings.Join(rules, "\n\n"),
+	)
 }
 
-func (cb *ContextBuilder) getDiscoveryRule() string {
-	if !cb.toolDiscoveryBM25 && !cb.toolDiscoveryRegex {
+func formatToolDiscoveryRule(useBM25, useRegex bool) string {
+	if !useBM25 && !useRegex {
 		return ""
 	}
 
 	var toolNames []string
-	if cb.toolDiscoveryBM25 {
+	if useBM25 {
 		toolNames = append(toolNames, `"tool_search_tool_bm25"`)
 	}
-	if cb.toolDiscoveryRegex {
+	if useRegex {
 		toolNames = append(toolNames, `"tool_search_tool_regex"`)
 	}
 
@@ -128,43 +217,128 @@ func (cb *ContextBuilder) getDiscoveryRule() string {
 }
 
 func (cb *ContextBuilder) BuildSystemPrompt() string {
-	parts := []string{}
+	return renderPromptPartsLegacy(cb.BuildSystemPromptParts())
+}
+
+func (cb *ContextBuilder) BuildSystemPromptParts() []PromptPart {
+	return cb.buildSystemPromptParts(systemPromptBuildOptions{
+		IncludeSkillCatalog: true,
+		IncludeToolUseRule:  true,
+	})
+}
+
+type systemPromptBuildOptions struct {
+	IncludeSkillCatalog bool
+	IncludeToolUseRule  bool
+	AllowedSkills       []string
+	AllowedTools        []string
+}
+
+func (cb *ContextBuilder) buildSystemPromptParts(opts systemPromptBuildOptions) []PromptPart {
+	stack := NewPromptStack(cb.promptRegistryOrDefault())
+	add := func(part PromptPart) {
+		if err := stack.Add(part); err != nil {
+			logger.WarnCF("agent", "Skipping invalid prompt part", map[string]any{
+				"id":     part.ID,
+				"layer":  part.Layer,
+				"slot":   part.Slot,
+				"source": part.Source.ID,
+				"error":  err.Error(),
+			})
+		}
+	}
 
 	// Core identity section
-	parts = append(parts, cb.getIdentity())
+	add(PromptPart{
+		ID:      "kernel.identity",
+		Layer:   PromptLayerKernel,
+		Slot:    PromptSlotIdentity,
+		Source:  PromptSource{ID: PromptSourceKernel, Name: "identity"},
+		Title:   "picoclaw identity",
+		Content: cb.getIdentity(opts.IncludeToolUseRule),
+		Stable:  true,
+		Cache:   PromptCacheEphemeral,
+	})
 
 	// Bootstrap files
 	bootstrapContent := cb.LoadBootstrapFiles()
 	if bootstrapContent != "" {
-		parts = append(parts, bootstrapContent)
+		add(PromptPart{
+			ID:      "instruction.workspace",
+			Layer:   PromptLayerInstruction,
+			Slot:    PromptSlotWorkspace,
+			Source:  PromptSource{ID: PromptSourceWorkspace, Name: "workspace"},
+			Title:   "workspace instructions",
+			Content: bootstrapContent,
+			Stable:  true,
+			Cache:   PromptCacheEphemeral,
+		})
 	}
 
 	// Skills - show summary, AI can read full content with read_file tool
-	skillsSummary := cb.skillsLoader.BuildSkillsSummary()
+	skillsSummary := ""
+	if opts.IncludeSkillCatalog {
+		skillsSummary = cb.buildSkillsSummary(opts.AllowedSkills)
+	}
 	if skillsSummary != "" {
-		parts = append(parts, fmt.Sprintf(`# Skills
+		skillIntro := "The following skills extend your capabilities."
+		readFileAllowed := promptAllowsTool(
+			PromptBuildRequest{AllowedTools: opts.AllowedTools},
+			"read_file",
+		)
+		if opts.IncludeToolUseRule && readFileAllowed {
+			skillIntro += " To use a skill, read its SKILL.md file using the read_file tool."
+		}
+		add(PromptPart{
+			ID:     "capability.skill_catalog",
+			Layer:  PromptLayerCapability,
+			Slot:   PromptSlotSkillCatalog,
+			Source: PromptSource{ID: PromptSourceSkillCatalog, Name: "skill:index"},
+			Title:  "skill catalog",
+			Content: fmt.Sprintf(`# Skills
 
-The following skills extend your capabilities. To use a skill, read its SKILL.md file using the read_file tool.
+%s
 
-%s`, skillsSummary))
+%s`, skillIntro, skillsSummary),
+			Stable: true,
+			Cache:  PromptCacheEphemeral,
+		})
 	}
 
 	// Memory context
 	memoryContext := cb.memory.GetMemoryContext()
 	if memoryContext != "" {
-		parts = append(parts, "# Memory\n\n"+memoryContext)
+		add(PromptPart{
+			ID:      "context.memory",
+			Layer:   PromptLayerContext,
+			Slot:    PromptSlotMemory,
+			Source:  PromptSource{ID: PromptSourceMemory, Name: "memory:workspace"},
+			Title:   "memory",
+			Content: "# Memory\n\n" + memoryContext,
+			Stable:  true,
+			Cache:   PromptCacheEphemeral,
+		})
 	}
 
 	// Multi-Message Sending (if enabled)
 	if cb.splitOnMarker {
-		parts = append(parts, `# MULTI-MESSAGE OUTPUT
+		add(PromptPart{
+			ID:     "context.output_policy.split_on_marker",
+			Layer:  PromptLayerContext,
+			Slot:   PromptSlotOutput,
+			Source: PromptSource{ID: PromptSourceOutputPolicy, Name: "split_on_marker"},
+			Title:  "multi-message output policy",
+			Content: `# MULTI-MESSAGE OUTPUT
 You MUST frequently use <|[SPLIT]|> to break your responses into multiple short messages. NEVER output a single long wall of text. Actively split distinct concepts or parts. Example: Message part 1<|[SPLIT]|>Message part 2<|[SPLIT]|>Message part 3
 
-Each part separated by the marker will be sent as an independent message.`)
+Each part separated by the marker will be sent as an independent message.`,
+			Stable: true,
+			Cache:  PromptCacheEphemeral,
+		})
 	}
 
-	// Join with "---" separator
-	return strings.Join(parts, "\n\n---\n\n")
+	stack.Seal()
+	return stack.Parts()
 }
 
 // BuildSystemPromptWithCache returns the cached system prompt if available
@@ -208,6 +382,139 @@ func (cb *ContextBuilder) BuildSystemPromptWithCache() string {
 		})
 
 	return prompt
+}
+
+func (cb *ContextBuilder) buildSystemPromptForRequest(
+	req PromptBuildRequest,
+) (string, []providers.ContentBlock) {
+	if req.SuppressDefaultSystemPrompt {
+		return "", nil
+	}
+
+	useDefaultCache := !req.SuppressSkillContext &&
+		!req.SuppressToolUseRule &&
+		len(req.AllowedSkills) == 0 &&
+		len(req.AllowedTools) == 0
+	if useDefaultCache {
+		staticPrompt := cb.BuildSystemPromptWithCache()
+		return staticPrompt, []providers.ContentBlock{
+			promptContentBlock(PromptPart{
+				ID:      "kernel.static",
+				Layer:   PromptLayerKernel,
+				Slot:    PromptSlotIdentity,
+				Source:  PromptSource{ID: PromptSourceKernel, Name: "static"},
+				Content: staticPrompt,
+			}, &providers.CacheControl{Type: "ephemeral"}),
+		}
+	}
+
+	parts := cb.buildSystemPromptParts(systemPromptBuildOptions{
+		IncludeSkillCatalog: !req.SuppressSkillContext,
+		IncludeToolUseRule:  !req.SuppressToolUseRule,
+		AllowedSkills:       req.AllowedSkills,
+		AllowedTools:        req.AllowedTools,
+	})
+	staticPrompt := renderPromptPartsLegacy(parts)
+	blocks := make([]providers.ContentBlock, 0, len(parts))
+	for _, part := range parts {
+		if strings.TrimSpace(part.Content) == "" {
+			continue
+		}
+		blocks = append(blocks, promptContentBlock(part, cacheControlForPromptPart(part)))
+	}
+	return staticPrompt, blocks
+}
+
+func (cb *ContextBuilder) buildSkillsSummary(allowed []string) string {
+	if cb.skillsLoader == nil {
+		return ""
+	}
+	if len(allowed) == 0 {
+		return cb.skillsLoader.BuildSkillsSummary()
+	}
+	allowedSet := cleanAllowedSet(allowed)
+	if len(allowedSet) == 0 {
+		return ""
+	}
+
+	var lines []string
+	lines = append(lines, "<skills>")
+	for _, s := range cb.skillsLoader.ListSkills() {
+		if _, ok := allowedSet[strings.ToLower(strings.TrimSpace(s.Name))]; !ok {
+			continue
+		}
+		lines = append(lines, "  <skill>")
+		lines = append(lines, fmt.Sprintf("    <name>%s</name>", xmlEscapeForPrompt(s.Name)))
+		lines = append(
+			lines,
+			fmt.Sprintf("    <description>%s</description>", xmlEscapeForPrompt(s.Description)),
+		)
+		lines = append(
+			lines,
+			fmt.Sprintf("    <location>%s</location>", xmlEscapeForPrompt(s.Path)),
+		)
+		lines = append(lines, fmt.Sprintf("    <source>%s</source>", xmlEscapeForPrompt(s.Source)))
+		lines = append(lines, "  </skill>")
+	}
+	if len(lines) == 1 {
+		return ""
+	}
+	lines = append(lines, "</skills>")
+	return strings.Join(lines, "\n")
+}
+
+func xmlEscapeForPrompt(s string) string {
+	replacer := strings.NewReplacer(
+		"&", "&amp;",
+		"<", "&lt;",
+		">", "&gt;",
+		"\"", "&quot;",
+		"'", "&apos;",
+	)
+	return replacer.Replace(s)
+}
+
+// EstimateSystemTokens estimates the token count of the full system message
+// that would be sent to the LLM, mirroring the composition logic in BuildMessages.
+// It includes: static prompt, dynamic context, active skills, and summary with
+// wrapping prefixes and separators. This avoids needing all per-request parameters
+// that BuildMessages requires (media, channel, chatID, sender, etc.).
+func (cb *ContextBuilder) EstimateSystemTokens(summary string, activeSkills []string) int {
+	staticPrompt := cb.BuildSystemPromptWithCache()
+
+	// Dynamic context is small and varies per request; use a representative estimate.
+	// Actual buildDynamicContext produces ~200-400 chars of time/runtime/session info.
+	const dynamicContextChars = 300
+
+	totalChars := utf8.RuneCountInString(staticPrompt) + dynamicContextChars
+
+	if skillsText := cb.buildActiveSkillsContext(activeSkills); skillsText != "" {
+		totalChars += utf8.RuneCountInString(skillsText)
+		totalChars += 7 // separator \n\n---\n\n
+	}
+
+	if contributedParts, err := cb.promptRegistryOrDefault().Collect(context.Background(), PromptBuildRequest{
+		Summary:      summary,
+		ActiveSkills: append([]string(nil), activeSkills...),
+	}); err == nil {
+		for _, part := range contributedParts {
+			if strings.TrimSpace(part.Content) == "" {
+				continue
+			}
+			totalChars += utf8.RuneCountInString(part.Content)
+			totalChars += 7 // separator
+		}
+	}
+
+	if summary != "" {
+		// Matches the CONTEXT_SUMMARY: prefix added in BuildMessages
+		const summaryPrefix = "CONTEXT_SUMMARY: The following is an approximate summary of prior conversation " +
+			"for reference only. It may be incomplete or outdated — always defer to explicit instructions.\n\n"
+		totalChars += utf8.RuneCountInString(summaryPrefix) + utf8.RuneCountInString(summary)
+		totalChars += 7 // separator
+	}
+
+	return totalChars * 2 / 5 // same heuristic as tokenizer.EstimateMessageTokens
 }
 
 // InvalidateCache clears the cached system prompt.
@@ -492,7 +799,9 @@ func formatCurrentSenderLine(senderID, senderDisplayName string) string {
 	}
 }
 
-func (cb *ContextBuilder) buildDynamicContext(channel, chatID, senderID, senderDisplayName string) string {
+func (cb *ContextBuilder) buildDynamicContext(
+	channel, chatID, senderID, senderDisplayName string,
+) string {
 	now := time.Now().Format("2006-01-02 15:04 (Monday)")
 	rt := fmt.Sprintf("%s %s, Go %s", runtime.GOOS, runtime.GOARCH, runtime.Version())
 
@@ -517,21 +826,34 @@ func (cb *ContextBuilder) BuildMessages(
 	channel, chatID, senderID, senderDisplayName string,
 	activeSkills ...string,
 ) []providers.Message {
+	return cb.BuildMessagesFromPrompt(PromptBuildRequest{
+		History:           history,
+		Summary:           summary,
+		CurrentMessage:    currentMessage,
+		Media:             media,
+		Channel:           channel,
+		ChatID:            chatID,
+		SenderID:          senderID,
+		SenderDisplayName: senderDisplayName,
+		ActiveSkills:      append([]string(nil), activeSkills...),
+	})
+}
+
+func (cb *ContextBuilder) BuildMessagesFromPrompt(req PromptBuildRequest) []providers.Message {
 	messages := []providers.Message{}
 
-	// The static part (identity, bootstrap, skills, memory) is cached locally to
-	// avoid repeated file I/O and string building on every call (fixes issue #607).
-	// Dynamic parts (time, session, summary) are appended per request.
+	// The default static part (identity, bootstrap, skills, memory) is cached
+	// locally to avoid repeated file I/O and string building on every call
+	// (fixes issue #607). Profile-customized static prompts are built on demand.
+	// Dynamic parts (time, session, summary) are appended per request unless the
+	// profile suppresses PicoClaw system context.
 	// Everything is sent as a single system message for provider compatibility:
 	// - Anthropic adapter extracts messages[0] (Role=="system") and maps its content
 	//   to the top-level "system" parameter in the Messages API request. A single
 	//   contiguous system block makes this extraction straightforward.
 	// - Codex maps only the first system message to its instructions field.
 	// - OpenAI-compat passes messages through as-is.
-	staticPrompt := cb.BuildSystemPromptWithCache()
-
-	// Build short dynamic context (time, runtime, session) — changes per request
-	dynamicCtx := cb.buildDynamicContext(channel, chatID, senderID, senderDisplayName)
+	staticPrompt, contentBlocks := cb.buildSystemPromptForRequest(req)
 
 	// Compose a single system message: static (cached) + dynamic + optional summary.
 	// Keeping all system content in one message ensures every provider adapter can
@@ -542,25 +864,105 @@ func (cb *ContextBuilder) BuildMessages(
 	// cache-aware adapters (Anthropic) can set per-block cache_control.
 	// The static block is marked "ephemeral" — its prefix hash is stable
 	// across requests, enabling LLM-side KV cache reuse.
-	stringParts := []string{staticPrompt, dynamicCtx}
-
-	contentBlocks := []providers.ContentBlock{
-		{Type: "text", Text: staticPrompt, CacheControl: &providers.CacheControl{Type: "ephemeral"}},
-		{Type: "text", Text: dynamicCtx},
+	var stringParts []string
+	if strings.TrimSpace(staticPrompt) != "" {
+		stringParts = append(stringParts, staticPrompt)
 	}
 
-	if skillsText := cb.buildActiveSkillsContext(activeSkills); skillsText != "" {
-		stringParts = append(stringParts, skillsText)
-		contentBlocks = append(contentBlocks, providers.ContentBlock{Type: "text", Text: skillsText})
+	promptParts := append([]PromptPart(nil), req.Overlays...)
+	if !req.SuppressDefaultSystemPrompt && !req.SuppressSkillContext {
+		activeSkills := append([]string(nil), req.ActiveSkills...)
+		if len(req.AllowedSkills) > 0 {
+			activeSkills = filterNamesByTurnProfile(activeSkills, req.AllowedSkills)
+		}
+		promptParts = append(promptParts, cb.buildActiveSkillsPromptParts(activeSkills)...)
+	}
+	if !req.SuppressDefaultSystemPrompt {
+		if contributedParts, err := cb.promptRegistryOrDefault().Collect(context.Background(), req); err != nil {
+			logger.WarnCF("agent", "Prompt contributor collection failed", map[string]any{
+				"error": err.Error(),
+			})
+		} else {
+			promptParts = append(promptParts, contributedParts...)
+		}
 	}
 
-	if summary != "" {
-		summaryText := fmt.Sprintf(
-			"CONTEXT_SUMMARY: The following is an approximate summary of prior conversation "+
-				"for reference only. It may be incomplete or outdated — always defer to explicit instructions.\n\n%s",
-			summary)
-		stringParts = append(stringParts, summaryText)
-		contentBlocks = append(contentBlocks, providers.ContentBlock{Type: "text", Text: summaryText})
+	if len(promptParts) > 0 {
+		for _, overlay := range sortPromptParts(promptParts) {
+			if strings.TrimSpace(overlay.Content) == "" {
+				continue
+			}
+			if err := cb.promptRegistryOrDefault().ValidatePart(overlay); err != nil {
+				logger.WarnCF("agent", "Skipping invalid prompt overlay", map[string]any{
+					"id":     overlay.ID,
+					"layer":  overlay.Layer,
+					"slot":   overlay.Slot,
+					"source": overlay.Source.ID,
+					"error":  err.Error(),
+				})
+				continue
+			}
+			stringParts = append(stringParts, overlay.Content)
+			contentBlocks = append(contentBlocks, promptContentBlock(overlay, nil))
+		}
+	}
+
+	dynamicChars := 0
+	if !req.SuppressDefaultSystemPrompt {
+		// Build short dynamic context (time, runtime, session) — changes per request
+		dynamicCtx := cb.buildDynamicContext(
+			req.Channel,
+			req.ChatID,
+			req.SenderID,
+			req.SenderDisplayName,
+		)
+		dynamicChars = len(dynamicCtx)
+		runtimePart := PromptPart{
+			ID:      "context.runtime",
+			Layer:   PromptLayerContext,
+			Slot:    PromptSlotRuntime,
+			Source:  PromptSource{ID: PromptSourceRuntime, Name: "runtime"},
+			Title:   "runtime context",
+			Content: dynamicCtx,
+			Stable:  false,
+			Cache:   PromptCacheNone,
+		}
+		stringParts = append(stringParts, dynamicCtx)
+		contentBlocks = append(contentBlocks, promptContentBlock(runtimePart, nil))
+
+		if req.Summary != "" {
+			summaryPart := PromptPart{
+				ID:     "context.summary",
+				Layer:  PromptLayerContext,
+				Slot:   PromptSlotSummary,
+				Source: PromptSource{ID: PromptSourceSummary, Name: "context.summary"},
+				Title:  "context summary",
+				Content: fmt.Sprintf(
+					"CONTEXT_SUMMARY: The following is an approximate summary of prior conversation "+
+						"for reference only. It may be incomplete or outdated — always defer to explicit instructions.\n\n%s",
+					req.Summary,
+				),
+				Stable: false,
+				Cache:  PromptCacheNone,
+			}
+			stringParts = append(stringParts, summaryPart.Content)
+			contentBlocks = append(contentBlocks, promptContentBlock(summaryPart, nil))
+		}
+	}
+
+	if len(stringParts) == 0 && req.ToolUseFallback {
+		fallbackPart := PromptPart{
+			ID:      "kernel.tool_use_fallback",
+			Layer:   PromptLayerKernel,
+			Slot:    PromptSlotIdentity,
+			Source:  PromptSource{ID: PromptSourceKernel, Name: "tool_use_fallback"},
+			Title:   "tool use fallback",
+			Content: toolUseSystemPromptRule(),
+			Stable:  true,
+			Cache:   PromptCacheEphemeral,
+		}
+		stringParts = append(stringParts, fallbackPart.Content)
+		contentBlocks = append(contentBlocks, promptContentBlock(fallbackPart, nil))
 	}
 
 	fullSystemPrompt := strings.Join(stringParts, "\n\n---\n\n")
@@ -575,9 +977,10 @@ func (cb *ContextBuilder) BuildMessages(
 	logger.DebugCF("agent", "System prompt built",
 		map[string]any{
 			"static_chars":  len(staticPrompt),
-			"dynamic_chars": len(dynamicCtx),
+			"dynamic_chars": dynamicChars,
 			"total_chars":   len(fullSystemPrompt),
-			"has_summary":   summary != "",
+			"has_summary":   req.Summary != "",
+			"overlays":      len(req.Overlays),
 			"cached":        isCached,
 		})
 
@@ -588,30 +991,30 @@ func (cb *ContextBuilder) BuildMessages(
 			"preview": preview,
 		})
 
-	history = sanitizeHistoryForProvider(history)
+	history := sanitizeHistoryForProvider(req.History)
 
 	// Single system message containing all context — compatible with all providers.
 	// SystemParts enables cache-aware adapters to set per-block cache_control;
 	// Content is the concatenated fallback for adapters that don't read SystemParts.
-	messages = append(messages, providers.Message{
-		Role:        "system",
-		Content:     fullSystemPrompt,
-		SystemParts: contentBlocks,
-	})
+	if strings.TrimSpace(fullSystemPrompt) != "" {
+		messages = append(messages, providers.Message{
+			Role:        "system",
+			Content:     fullSystemPrompt,
+			SystemParts: contentBlocks,
+		})
+	}
 
 	// Add conversation history
 	messages = append(messages, history...)
 
-	// Add current user message
-	if strings.TrimSpace(currentMessage) != "" {
-		msg := providers.Message{
-			Role:    "user",
-			Content: currentMessage,
-		}
-		if len(media) > 0 {
-			msg.Media = media
-		}
-		messages = append(messages, msg)
+	// Add current user message. Media-only turns must still be preserved so
+	// multimodal providers receive the uploaded image even when the user sends
+	// no accompanying text.
+	if strings.TrimSpace(req.CurrentMessage) != "" || len(req.Media) > 0 {
+		messages = append(messages, userPromptMessage(req.CurrentMessage, req.Media))
+	}
+	if len(messages) == 0 {
+		messages = append(messages, userPromptMessage("", nil))
 	}
 
 	return messages
@@ -659,7 +1062,11 @@ func sanitizeHistoryForProvider(history []providers.Message) []providers.Message
 		case "assistant":
 			if len(msg.ToolCalls) > 0 {
 				if len(sanitized) == 0 {
-					logger.DebugCF("agent", "Dropping assistant tool-call turn at history start", map[string]any{})
+					logger.DebugCF(
+						"agent",
+						"Dropping assistant tool-call turn at history start",
+						map[string]any{},
+					)
 					continue
 				}
 				prev := sanitized[len(sanitized)-1]
@@ -683,43 +1090,72 @@ func sanitizeHistoryForProvider(history []providers.Message) []providers.Message
 	// tool result messages following it. This is required by strict providers
 	// like DeepSeek that enforce: "An assistant message with 'tool_calls' must
 	// be followed by tool messages responding to each 'tool_call_id'."
+	//
+	// Deduplication is scoped to the contiguous tool-result block that follows a
+	// single assistant tool-call message. Some providers legitimately reuse call
+	// IDs across separate turns (for example "call_0"), so global deduplication
+	// would incorrectly delete later valid tool results and leave an
+	// assistant(tool_calls) -> assistant sequence behind.
 	final := make([]providers.Message, 0, len(sanitized))
-	seenToolCallID := make(map[string]bool)
 	for i := 0; i < len(sanitized); i++ {
 		msg := sanitized[i]
 
-		// Deduplicate tool results by ToolCallID
-		if msg.Role == "tool" && msg.ToolCallID != "" {
-			if seenToolCallID[msg.ToolCallID] {
-				logger.DebugCF("agent", "Dropping duplicate tool result", map[string]any{
-					"tool_call_id": msg.ToolCallID,
-				})
-				continue
-			}
-			seenToolCallID[msg.ToolCallID] = true
-		}
-
 		if msg.Role == "assistant" && len(msg.ToolCalls) > 0 {
-			// Collect expected tool_call IDs
 			expected := make(map[string]bool, len(msg.ToolCalls))
+			invalidToolCallID := false
 			for _, tc := range msg.ToolCalls {
+				if tc.ID == "" {
+					invalidToolCallID = true
+					continue
+				}
 				expected[tc.ID] = false
 			}
 
-			// Check following messages for matching tool results
-			toolMsgCount := 0
-			for j := i + 1; j < len(sanitized); j++ {
-				if sanitized[j].Role != "tool" {
+			block := make([]providers.Message, 0, len(expected))
+			seenInBlock := make(map[string]bool, len(expected))
+			j := i + 1
+			for ; j < len(sanitized); j++ {
+				next := sanitized[j]
+				if next.Role != "tool" {
 					break
 				}
-				toolMsgCount++
-				if _, exists := expected[sanitized[j].ToolCallID]; exists {
-					expected[sanitized[j].ToolCallID] = true
+				if next.ToolCallID == "" {
+					logger.DebugCF(
+						"agent",
+						"Dropping tool result without tool_call_id",
+						map[string]any{},
+					)
+					continue
 				}
+				if _, ok := expected[next.ToolCallID]; !ok {
+					logger.DebugCF("agent", "Dropping unexpected tool result", map[string]any{
+						"tool_call_id": next.ToolCallID,
+					})
+					continue
+				}
+				if seenInBlock[next.ToolCallID] {
+					logger.DebugCF(
+						"agent",
+						"Dropping duplicate tool result in tool block",
+						map[string]any{
+							"tool_call_id": next.ToolCallID,
+						},
+					)
+					continue
+				}
+				seenInBlock[next.ToolCallID] = true
+				expected[next.ToolCallID] = true
+				block = append(block, next)
 			}
 
-			// If any tool_call_id is missing, drop this assistant message and its partial tool messages
-			allFound := true
+			allFound := !invalidToolCallID
+			if invalidToolCallID {
+				logger.DebugCF(
+					"agent",
+					"Dropping assistant message with empty tool_call_id",
+					map[string]any{},
+				)
+			}
 			for toolCallID, found := range expected {
 				if !found {
 					allFound = false
@@ -729,7 +1165,7 @@ func sanitizeHistoryForProvider(history []providers.Message) []providers.Message
 						map[string]any{
 							"missing_tool_call_id": toolCallID,
 							"expected_count":       len(expected),
-							"found_count":          toolMsgCount,
+							"found_count":          len(block),
 						},
 					)
 					break
@@ -737,11 +1173,27 @@ func sanitizeHistoryForProvider(history []providers.Message) []providers.Message
 			}
 
 			if !allFound {
-				// Skip this assistant message and its tool messages
-				i += toolMsgCount
+				i = j - 1
 				continue
 			}
+
+			final = append(final, msg)
+			final = append(final, block...)
+			i = j - 1
+			continue
 		}
+
+		if msg.Role == "tool" {
+			logger.DebugCF(
+				"agent",
+				"Dropping orphaned tool message after validation",
+				map[string]any{
+					"tool_call_id": msg.ToolCallID,
+				},
+			)
+			continue
+		}
+
 		final = append(final, msg)
 	}
 
@@ -775,8 +1227,26 @@ func (cb *ContextBuilder) AddAssistantMessage(
 }
 
 func (cb *ContextBuilder) buildActiveSkillsContext(skillNames []string) string {
-	if cb.skillsLoader == nil || len(skillNames) == 0 {
+	ordered := cb.ResolveActiveSkillsForContext(skillNames)
+	if len(ordered) == 0 {
 		return ""
+	}
+
+	content := cb.skillsLoader.LoadSkillsForContext(ordered)
+	if strings.TrimSpace(content) == "" {
+		return ""
+	}
+
+	return fmt.Sprintf(`# Active Skills
+
+The following skills are active for this request. Follow them when relevant.
+
+%s`, content)
+}
+
+func (cb *ContextBuilder) ResolveActiveSkillsForContext(skillNames []string) []string {
+	if cb.skillsLoader == nil || len(skillNames) == 0 {
+		return nil
 	}
 
 	var ordered []string
@@ -793,19 +1263,29 @@ func (cb *ContextBuilder) buildActiveSkillsContext(skillNames []string) string {
 		ordered = append(ordered, canonical)
 	}
 	if len(ordered) == 0 {
-		return ""
+		return nil
+	}
+	return ordered
+}
+
+func (cb *ContextBuilder) buildActiveSkillsPromptParts(skillNames []string) []PromptPart {
+	skillsText := cb.buildActiveSkillsContext(skillNames)
+	if strings.TrimSpace(skillsText) == "" {
+		return nil
 	}
 
-	content := cb.skillsLoader.LoadSkillsForContext(ordered)
-	if strings.TrimSpace(content) == "" {
-		return ""
+	return []PromptPart{
+		{
+			ID:      "capability.active_skills",
+			Layer:   PromptLayerCapability,
+			Slot:    PromptSlotActiveSkill,
+			Source:  PromptSource{ID: PromptSourceActiveSkills, Name: "skill:active"},
+			Title:   "active skills",
+			Content: skillsText,
+			Stable:  false,
+			Cache:   PromptCacheNone,
+		},
 	}
-
-	return fmt.Sprintf(`# Active Skills
-
-The following skills are active for this request. Follow them when relevant.
-
-%s`, content)
 }
 
 func (cb *ContextBuilder) ListSkillNames() []string {

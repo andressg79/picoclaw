@@ -2,13 +2,13 @@ package agent
 
 import (
 	"context"
-	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
 
 	"github.com/sipeed/picoclaw/pkg/config"
+	"github.com/sipeed/picoclaw/pkg/isolation"
 	"github.com/sipeed/picoclaw/pkg/logger"
 	"github.com/sipeed/picoclaw/pkg/media"
 	"github.com/sipeed/picoclaw/pkg/memory"
@@ -30,6 +30,7 @@ type AgentInstance struct {
 	MaxTokens                 int
 	Temperature               float64
 	ThinkingLevel             ThinkingLevel
+	ThinkingLevelConfigured   bool
 	ContextWindow             int
 	SummarizeMessageThreshold int
 	SummarizeTokenPercent     int
@@ -37,9 +38,12 @@ type AgentInstance struct {
 	Sessions                  session.SessionStore
 	ContextBuilder            *ContextBuilder
 	Tools                     *tools.ToolRegistry
+	Definition                AgentContextDefinition
 	Subagents                 *config.SubagentsConfig
 	SkillsFilter              []string
+	MCPServerAllowlist        map[string]struct{}
 	Candidates                []providers.FallbackCandidate
+	ImageCandidates           []providers.FallbackCandidate
 
 	// Router is non-nil when model routing is configured and the light model
 	// was successfully resolved. It scores each incoming message and decides
@@ -51,6 +55,10 @@ type AgentInstance struct {
 	// LightProvider is the concrete provider instance for the configured light model.
 	// It is only used when routing selects the light tier for a turn.
 	LightProvider providers.LLMProvider
+	// CandidateProviders maps "provider/model" keys to per-candidate LLMProvider
+	// instances. This allows each fallback model to use its own api_base and api_key
+	// from model_list, instead of inheriting the primary model's provider config.
+	CandidateProviders map[string]providers.LLMProvider
 }
 
 // NewAgentInstance creates an agent instance from config.
@@ -60,10 +68,18 @@ func NewAgentInstance(
 	cfg *config.Config,
 	provider providers.LLMProvider,
 ) *AgentInstance {
+	if cfg != nil {
+		// Keep the subprocess isolation runtime aligned with the latest loaded config
+		// before any tools or providers start spawning child processes.
+		isolation.Configure(cfg)
+	}
+
 	workspace := resolveAgentWorkspace(agentCfg, defaults)
 	os.MkdirAll(workspace, 0o755)
 
-	model := resolveAgentModel(agentCfg, defaults)
+	definition := loadAgentDefinition(workspace)
+
+	model := resolveAgentModel(agentCfg, defaults, definition)
 	fallbacks := resolveAgentFallbacks(agentCfg, defaults)
 
 	restrict := defaults.RestrictToWorkspace
@@ -72,12 +88,20 @@ func NewAgentInstance(
 	// Compile path whitelist patterns from config.
 	allowReadPaths := buildAllowReadPatterns(cfg)
 	allowWritePaths := compilePatterns(cfg.Tools.AllowWritePaths)
+	agentToolAllowlist := resolveAgentToolAllowlist(definition)
+	agentMCPServerAllowlist := resolveAgentMCPServerAllowlist(definition)
 
 	toolsRegistry := tools.NewToolRegistry()
+	toolsRegistry.SetAllowlist(agentToolAllowlist)
 
 	if cfg.Tools.IsToolEnabled("read_file") {
 		maxReadFileSize := cfg.Tools.ReadFile.MaxReadFileSize
-		toolsRegistry.Register(tools.NewReadFileTool(workspace, readRestrict, maxReadFileSize, allowReadPaths))
+		switch cfg.Tools.ReadFile.EffectiveMode() {
+		case config.ReadFileModeLines:
+			toolsRegistry.Register(tools.NewReadFileLinesTool(workspace, readRestrict, maxReadFileSize, allowReadPaths))
+		default:
+			toolsRegistry.Register(tools.NewReadFileBytesTool(workspace, readRestrict, maxReadFileSize, allowReadPaths))
+		}
 	}
 	if cfg.Tools.IsToolEnabled("write_file") {
 		toolsRegistry.Register(tools.NewWriteFileTool(workspace, restrict, allowWritePaths))
@@ -105,7 +129,7 @@ func NewAgentInstance(
 	sessionsDir := filepath.Join(workspace, "sessions")
 	sessions := initSessionStore(sessionsDir)
 
-	mcpDiscoveryActive := cfg.Tools.MCP.Enabled && cfg.Tools.MCP.Discovery.Enabled
+	mcpDiscoveryActive := agentHasDiscoverableMCPServers(cfg, agentMCPServerAllowlist)
 	contextBuilder := NewContextBuilder(workspace).
 		WithToolDiscovery(
 			mcpDiscoveryActive && cfg.Tools.MCP.Discovery.UseBM25,
@@ -121,9 +145,14 @@ func NewAgentInstance(
 	if agentCfg != nil {
 		agentID = routing.NormalizeAgentID(agentCfg.ID)
 		agentName = agentCfg.Name
+		if definition.Agent != nil && strings.TrimSpace(definition.Agent.Frontmatter.Name) != "" {
+			agentName = strings.TrimSpace(definition.Agent.Frontmatter.Name)
+		}
 		subagents = agentCfg.Subagents
-		skillsFilter = agentCfg.Skills
+		skillsFilter = resolveAgentSkillsFilter(agentCfg, definition)
 	}
+	provider = resolvePrimaryProviderForAgent(cfg, workspace, agentID, model, provider)
+	warnOnUnknownAgentMCPServerDeclarations(agentID, workspace, cfg, definition)
 
 	maxIter := defaults.MaxToolIterations
 	if maxIter == 0 {
@@ -156,6 +185,7 @@ func NewAgentInstance(
 		thinkingLevelStr = mc.ThinkingLevel
 	}
 	thinkingLevel := parseThinkingLevel(thinkingLevelStr)
+	thinkingLevelConfigured := isConfiguredThinkingLevel(thinkingLevelStr)
 
 	summarizeMessageThreshold := defaults.SummarizeMessageThreshold
 	if summarizeMessageThreshold == 0 {
@@ -169,6 +199,19 @@ func NewAgentInstance(
 
 	// Resolve fallback candidates
 	candidates := resolveModelCandidates(cfg, defaults.Provider, model, fallbacks)
+	imageCandidates := resolveModelCandidates(
+		cfg,
+		defaults.Provider,
+		defaults.ImageModel,
+		defaults.ImageModelFallbacks,
+	)
+
+	candidateProviders := make(map[string]providers.LLMProvider)
+	populateCandidateProvidersFromNames(cfg, workspace, fallbacks, candidateProviders)
+	if strings.TrimSpace(defaults.ImageModel) != "" {
+		imageNames := append([]string{defaults.ImageModel}, defaults.ImageModelFallbacks...)
+		populateCandidateProvidersFromNames(cfg, workspace, imageNames, candidateProviders)
+	}
 
 	// Model routing setup: pre-resolve light model candidates at creation time
 	// to avoid repeated model_list lookups on every incoming message.
@@ -180,8 +223,15 @@ func NewAgentInstance(
 		if len(resolved) > 0 {
 			lightModelCfg, err := resolvedModelConfig(cfg, rc.LightModel, workspace)
 			if err != nil {
-				logger.WarnCF("agent", "Routing light model config invalid; routing disabled",
-					map[string]any{"light_model": rc.LightModel, "agent_id": agentID, "error": err.Error()})
+				logger.WarnCF(
+					"agent",
+					"Routing light model config invalid; routing disabled",
+					map[string]any{
+						"light_model": rc.LightModel,
+						"agent_id":    agentID,
+						"error":       err.Error(),
+					},
+				)
 			} else {
 				lp, _, err := providers.CreateProviderFromConfig(lightModelCfg)
 				if err != nil {
@@ -194,6 +244,7 @@ func NewAgentInstance(
 					})
 					lightCandidates = resolved
 					lightProvider = lp
+					populateCandidateProvidersFromNames(cfg, workspace, []string{rc.LightModel}, candidateProviders)
 				}
 			}
 		} else {
@@ -212,6 +263,7 @@ func NewAgentInstance(
 		MaxTokens:                 maxTokens,
 		Temperature:               temperature,
 		ThinkingLevel:             thinkingLevel,
+		ThinkingLevelConfigured:   thinkingLevelConfigured,
 		ContextWindow:             contextWindow,
 		SummarizeMessageThreshold: summarizeMessageThreshold,
 		SummarizeTokenPercent:     summarizeTokenPercent,
@@ -219,13 +271,94 @@ func NewAgentInstance(
 		Sessions:                  sessions,
 		ContextBuilder:            contextBuilder,
 		Tools:                     toolsRegistry,
+		Definition:                definition,
 		Subagents:                 subagents,
 		SkillsFilter:              skillsFilter,
+		MCPServerAllowlist:        agentMCPServerAllowlist,
 		Candidates:                candidates,
+		ImageCandidates:           imageCandidates,
 		Router:                    router,
 		LightCandidates:           lightCandidates,
 		LightProvider:             lightProvider,
+		CandidateProviders:        candidateProviders,
 	}
+}
+
+// populateCandidateProvidersFromNames resolves each model name (alias or
+// "provider/model") via resolvedModelConfig and creates a dedicated LLMProvider
+// for it. This reuses the canonical config resolution path (GetModelConfig) so
+// alias handling and load-balancing stay consistent with the rest of the codebase.
+func populateCandidateProvidersFromNames(
+	cfg *config.Config,
+	workspace string,
+	names []string,
+	out map[string]providers.LLMProvider,
+) {
+	if cfg == nil || len(names) == 0 {
+		return
+	}
+	for _, name := range names {
+		mc, err := resolvedModelConfig(cfg, strings.TrimSpace(name), workspace)
+		if err != nil {
+			logger.WarnCF("agent",
+				"fallback provider: no model_list entry found; will inherit primary provider credentials",
+				map[string]any{"name": name, "error": err.Error()})
+			continue
+		}
+		protocol, modelID := providers.ExtractProtocol(mc)
+		key := providers.ModelKey(protocol, modelID)
+		if _, exists := out[key]; exists {
+			continue
+		}
+		p, _, err := providers.CreateProviderFromConfig(mc)
+		if err != nil {
+			logger.WarnCF("agent", "fallback provider: failed to create provider",
+				map[string]any{"model": mc.Model, "error": err.Error()})
+			continue
+		}
+		out[key] = p
+	}
+}
+
+// resolvePrimaryProviderForAgent resolves a dedicated provider for the active
+// primary model when the model points at a model_list entry. This keeps the
+// agent's single-candidate path aligned with the selected model's own
+// provider/api_base/api_key instead of inheriting the process default provider.
+func resolvePrimaryProviderForAgent(
+	cfg *config.Config,
+	workspace string,
+	agentID string,
+	model string,
+	fallback providers.LLMProvider,
+) providers.LLMProvider {
+	model = strings.TrimSpace(model)
+	if cfg == nil || model == "" {
+		return fallback
+	}
+
+	modelCfg := lookupModelConfigByRef(cfg, model)
+	if modelCfg == nil {
+		return fallback
+	}
+	clone := *modelCfg
+	if clone.Workspace == "" {
+		clone.Workspace = workspace
+	}
+
+	resolvedProvider, _, err := providers.CreateProviderFromConfig(&clone)
+	if err != nil {
+		logger.WarnCF("agent", "Primary model provider init failed; using injected provider",
+			map[string]any{
+				"agent_id": agentID,
+				"model":    model,
+				"error":    err.Error(),
+			})
+		return fallback
+	}
+	if resolvedProvider == nil {
+		return fallback
+	}
+	return resolvedProvider
 }
 
 // resolveAgentWorkspace determines the workspace directory for an agent.
@@ -234,7 +367,8 @@ func resolveAgentWorkspace(agentCfg *config.AgentConfig, defaults *config.AgentD
 		return expandHome(strings.TrimSpace(agentCfg.Workspace))
 	}
 	// Use the configured default workspace (respects PICOCLAW_HOME)
-	if agentCfg == nil || agentCfg.Default || agentCfg.ID == "" || routing.NormalizeAgentID(agentCfg.ID) == "main" {
+	if agentCfg == nil || agentCfg.Default || agentCfg.ID == "" ||
+		routing.NormalizeAgentID(agentCfg.ID) == "main" {
 		return expandHome(defaults.Workspace)
 	}
 	// For named agents without explicit workspace, use default workspace with agent ID suffix
@@ -243,7 +377,14 @@ func resolveAgentWorkspace(agentCfg *config.AgentConfig, defaults *config.AgentD
 }
 
 // resolveAgentModel resolves the primary model for an agent.
-func resolveAgentModel(agentCfg *config.AgentConfig, defaults *config.AgentDefaults) string {
+func resolveAgentModel(
+	agentCfg *config.AgentConfig,
+	defaults *config.AgentDefaults,
+	definition AgentContextDefinition,
+) string {
+	if definition.Agent != nil && strings.TrimSpace(definition.Agent.Frontmatter.Model) != "" {
+		return strings.TrimSpace(definition.Agent.Frontmatter.Model)
+	}
 	if agentCfg != nil && agentCfg.Model != nil && strings.TrimSpace(agentCfg.Model.Primary) != "" {
 		return strings.TrimSpace(agentCfg.Model.Primary)
 	}
@@ -258,12 +399,36 @@ func resolveAgentFallbacks(agentCfg *config.AgentConfig, defaults *config.AgentD
 	return defaults.ModelFallbacks
 }
 
+func resolveAgentSkillsFilter(
+	agentCfg *config.AgentConfig,
+	definition AgentContextDefinition,
+) []string {
+	if definition.Agent != nil && definition.Agent.Frontmatter.Skills != nil {
+		return append([]string(nil), definition.Agent.Frontmatter.Skills...)
+	}
+	if agentCfg == nil || agentCfg.Skills == nil {
+		return nil
+	}
+	return append([]string(nil), agentCfg.Skills...)
+}
+
+func (a *AgentInstance) AllowsMCPServer(serverName string) bool {
+	if a == nil || a.MCPServerAllowlist == nil {
+		return true
+	}
+	_, ok := a.MCPServerAllowlist[strings.ToLower(strings.TrimSpace(serverName))]
+	return ok
+}
+
 func compilePatterns(patterns []string) []*regexp.Regexp {
 	compiled := make([]*regexp.Regexp, 0, len(patterns))
 	for _, p := range patterns {
 		re, err := regexp.Compile(p)
 		if err != nil {
-			fmt.Printf("Warning: invalid path pattern %q: %v\n", p, err)
+			logger.WarnCF("agent", "invalid path pattern in compilePatterns", map[string]any{
+				"pattern": p,
+				"error":   err.Error(),
+			})
 			continue
 		}
 		compiled = append(compiled, re)

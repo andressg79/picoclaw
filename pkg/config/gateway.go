@@ -3,8 +3,10 @@ package config
 import (
 	"encoding/json"
 	"os"
+	"strings"
 
 	"github.com/sipeed/picoclaw/pkg/logger"
+	"github.com/sipeed/picoclaw/pkg/netbind"
 )
 
 const DefaultGatewayLogLevel = "warn"
@@ -49,6 +51,31 @@ func EffectiveGatewayLogLevel(cfg *Config) string {
 	return normalizeGatewayLogLevel(cfg.Gateway.LogLevel)
 }
 
+func resolveGatewayHostFromEnv(baseHost string) (string, error) {
+	envHost, ok := os.LookupEnv(EnvGatewayHost)
+	if !ok {
+		return normalizeGatewayHostInput(baseHost)
+	}
+
+	envHost = strings.TrimSpace(envHost)
+	if envHost == "" {
+		return normalizeGatewayHostInput(baseHost)
+	}
+
+	return normalizeGatewayHostInput(envHost)
+}
+
+func normalizeGatewayHostInput(host string) (string, error) {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		host = strings.TrimSpace(DefaultConfig().Gateway.Host)
+	}
+	if host == "" {
+		host = "localhost"
+	}
+	return netbind.NormalizeHostInput(host)
+}
+
 // ResolveGatewayLogLevel reads the configured gateway log level without triggering
 // the full config loader, so startup code can apply logging before config load logs run.
 // The PICOCLAW_LOG_LEVEL environment variable overrides the file value.
@@ -61,7 +88,12 @@ func ResolveGatewayLogLevel(path string) string {
 
 	data, err := os.ReadFile(path)
 	if err == nil {
-		_ = json.Unmarshal(data, &cfg)
+		if err := json.Unmarshal(data, &cfg); err != nil {
+			logger.WarnCF("config", "failed to parse gateway config, using defaults", map[string]any{
+				"path":  path,
+				"error": err.Error(),
+			})
+		}
 	}
 
 	if envLevel := os.Getenv("PICOCLAW_LOG_LEVEL"); envLevel != "" {

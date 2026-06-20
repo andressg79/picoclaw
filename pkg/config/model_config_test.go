@@ -7,6 +7,7 @@ package config
 
 import (
 	"encoding/json"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -144,40 +145,45 @@ func TestGetModelConfig_Concurrent(t *testing.T) {
 	}
 }
 
-func TestAgentDefaultsV0_JSON_BackwardCompat(t *testing.T) {
-	tests := []struct {
-		name     string
-		json     string
-		wantName string
-	}{
-		{
-			name:     "new model_name field",
-			json:     `{"model_name": "gpt4"}`,
-			wantName: "gpt4",
-		},
-		{
-			name:     "old model field",
-			json:     `{"model": "gpt4"}`,
-			wantName: "gpt4",
-		},
-		{
-			name:     "both fields - model_name wins",
-			json:     `{"model_name": "new", "model": "old"}`,
-			wantName: "new",
-		},
-	}
+func TestModelConfig_StreamingConfig(t *testing.T) {
+	t.Run("loads streaming enabled", func(t *testing.T) {
+		var cfg ModelConfig
+		err := json.Unmarshal([]byte(`{
+			"model_name": "stream-model",
+			"model": "openai/gpt-5.4",
+			"streaming": {"enabled": true}
+		}`), &cfg)
+		if err != nil {
+			t.Fatalf("Unmarshal() error = %v", err)
+		}
+		if !cfg.Streaming.Enabled {
+			t.Fatal("Streaming.Enabled = false, want true")
+		}
+	})
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			var defaults agentDefaultsV0
-			if err := json.Unmarshal([]byte(tt.json), &defaults); err != nil {
-				t.Fatalf("Unmarshal error: %v", err)
-			}
-			if got := defaults.GetModelName(); got != tt.wantName {
-				t.Errorf("GetModelName() = %q, want %q", got, tt.wantName)
-			}
-		})
-	}
+	t.Run("defaults disabled", func(t *testing.T) {
+		var cfg ModelConfig
+		err := json.Unmarshal([]byte(`{
+			"model_name": "plain-model",
+			"model": "openai/gpt-5.4"
+		}`), &cfg)
+		if err != nil {
+			t.Fatalf("Unmarshal() error = %v", err)
+		}
+		if cfg.Streaming.Enabled {
+			t.Fatal("Streaming.Enabled = true, want false by default")
+		}
+	})
+
+	t.Run("model streaming only has enabled", func(t *testing.T) {
+		typ := reflect.TypeOf(ModelStreamingConfig{})
+		if typ.NumField() != 1 {
+			t.Fatalf("ModelStreamingConfig field count = %d, want 1", typ.NumField())
+		}
+		if _, ok := typ.FieldByName("Enabled"); !ok {
+			t.Fatal("ModelStreamingConfig missing Enabled field")
+		}
+	})
 }
 
 func TestModelConfig_Validate(t *testing.T) {
@@ -191,6 +197,15 @@ func TestModelConfig_Validate(t *testing.T) {
 			config: ModelConfig{
 				ModelName: "test",
 				Model:     "openai/gpt-4o",
+			},
+			wantErr: false,
+		},
+		{
+			name: "valid tool schema transform",
+			config: ModelConfig{
+				ModelName:           "test",
+				Model:               "openai/gpt-4o",
+				ToolSchemaTransform: "simple",
 			},
 			wantErr: false,
 		},
@@ -211,6 +226,15 @@ func TestModelConfig_Validate(t *testing.T) {
 		{
 			name:    "empty config",
 			config:  ModelConfig{},
+			wantErr: true,
+		},
+		{
+			name: "invalid tool schema transform",
+			config: ModelConfig{
+				ModelName:           "test",
+				Model:               "openai/gpt-4o",
+				ToolSchemaTransform: "invalid",
+			},
 			wantErr: true,
 		},
 	}

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -66,7 +67,7 @@ func TestDownloadAndDecryptCDNBuffer(t *testing.T) {
 				}, nil
 			})},
 		},
-		config: config.WeixinConfig{
+		config: &config.WeixinSettings{
 			CDNBaseURL: "https://cdn.example.com",
 		},
 		typingCache: make(map[string]typingTicketCacheEntry),
@@ -105,7 +106,7 @@ func TestDownloadAndDecryptCDNBufferUsesFullURLWhenProvided(t *testing.T) {
 				return nil, nil
 			})},
 		},
-		config: config.WeixinConfig{
+		config: &config.WeixinSettings{
 			CDNBaseURL: "https://cdn.example.com",
 		},
 		typingCache: make(map[string]typingTicketCacheEntry),
@@ -155,7 +156,7 @@ func TestDownloadAndDecryptCDNBufferFallsBackToConstructedURLWhenFullURLFails(t 
 				}, nil
 			})},
 		},
-		config: config.WeixinConfig{
+		config: &config.WeixinSettings{
 			CDNBaseURL: "https://cdn.example.com",
 		},
 		typingCache: make(map[string]typingTicketCacheEntry),
@@ -224,7 +225,7 @@ func TestUploadBufferToCDN(t *testing.T) {
 				}, nil
 			})},
 		},
-		config: config.WeixinConfig{
+		config: &config.WeixinSettings{
 			CDNBaseURL: "https://cdn.example.com",
 		},
 		typingCache: make(map[string]typingTicketCacheEntry),
@@ -259,7 +260,7 @@ func TestBuildWeixinSyncBufPathUsesPicoclawHome(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv(config.EnvHome, home)
 
-	wxCfg := config.WeixinConfig{
+	wxCfg := &config.WeixinSettings{
 		BaseURL: "https://ilinkai.weixin.qq.com/",
 	}
 	wxCfg.SetToken("token-123")
@@ -317,5 +318,63 @@ func TestSelectInboundMediaItemFallsBackToRefMessage(t *testing.T) {
 	}
 	if item.Type != MessageItemTypeImage {
 		t.Fatalf("selectInboundMediaItem().Type = %d, want %d", item.Type, MessageItemTypeImage)
+	}
+}
+
+func TestSendUploadedMedia_SendsCaptionAsSeparateTextBeforeMedia(t *testing.T) {
+	var requests []SendMessageReq
+	ch := &WeixinChannel{
+		api: &ApiClient{
+			BaseURL: "https://ilinkai.weixin.qq.com/",
+			HttpClient: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				if r.URL.Path != "/ilink/bot/sendmessage" {
+					t.Fatalf("sendmessage path = %q, want /ilink/bot/sendmessage", r.URL.Path)
+				}
+				var req SendMessageReq
+				if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+					t.Fatalf("decode sendmessage req: %v", err)
+				}
+				requests = append(requests, req)
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       io.NopCloser(bytes.NewReader([]byte(`{"ret":0,"errcode":0}`))),
+					Header:     make(http.Header),
+				}, nil
+			})},
+		},
+		typingCache: make(map[string]typingTicketCacheEntry),
+	}
+
+	err := ch.sendUploadedMedia(
+		context.Background(),
+		"user-1",
+		"ctx-1",
+		"recipe translation",
+		UploadMediaTypeImage,
+		&uploadedFileInfo{
+			downloadParam: "download-token",
+			aesKeyHex:     "31323334353637383930616263646566",
+			fileSize:      11,
+			cipherSize:    16,
+			filename:      "photo.png",
+		},
+	)
+	if err != nil {
+		t.Fatalf("sendUploadedMedia() error = %v", err)
+	}
+	if len(requests) != 2 {
+		t.Fatalf("sendUploadedMedia() sent %d requests, want 2", len(requests))
+	}
+	if len(requests[0].Msg.ItemList) != 1 || requests[0].Msg.ItemList[0].Type != MessageItemTypeText {
+		t.Fatalf("first request item = %+v, want text item", requests[0].Msg.ItemList)
+	}
+	if got := requests[0].Msg.ItemList[0].TextItem.Text; got != "recipe translation" {
+		t.Fatalf("first request text = %q, want recipe translation", got)
+	}
+	if len(requests[1].Msg.ItemList) != 1 || requests[1].Msg.ItemList[0].Type != MessageItemTypeImage {
+		t.Fatalf("second request item = %+v, want image item", requests[1].Msg.ItemList)
+	}
+	if requests[1].Msg.ItemList[0].ImageItem == nil || requests[1].Msg.ItemList[0].ImageItem.Media == nil {
+		t.Fatalf("second request image media = %+v, want media ref", requests[1].Msg.ItemList[0].ImageItem)
 	}
 }

@@ -1,10 +1,17 @@
 package slack
 
 import (
+	"context"
+	"os"
+	"path/filepath"
 	"testing"
 
+	slacksdk "github.com/slack-go/slack"
+
 	"github.com/sipeed/picoclaw/pkg/bus"
+	"github.com/sipeed/picoclaw/pkg/channels"
 	"github.com/sipeed/picoclaw/pkg/config"
+	"github.com/sipeed/picoclaw/pkg/media"
 )
 
 func TestParseSlackChatID(t *testing.T) {
@@ -50,6 +57,24 @@ func TestParseSlackChatID(t *testing.T) {
 				t.Errorf("parseSlackChatID(%q) threadTS = %q, want %q", tt.chatID, threadTS, tt.wantThread)
 			}
 		})
+	}
+}
+
+func TestResolveSlackOutboundTarget_PrefersContextTopicID(t *testing.T) {
+	deliveryChatID, channelID, threadTS := resolveSlackOutboundTarget("C123456", &bus.InboundContext{
+		Channel: "slack",
+		ChatID:  "C123456",
+		TopicID: "1234567890.123456",
+	})
+
+	if deliveryChatID != "C123456/1234567890.123456" {
+		t.Fatalf("deliveryChatID = %q, want %q", deliveryChatID, "C123456/1234567890.123456")
+	}
+	if channelID != "C123456" {
+		t.Fatalf("channelID = %q, want %q", channelID, "C123456")
+	}
+	if threadTS != "1234567890.123456" {
+		t.Fatalf("threadTS = %q, want %q", threadTS, "1234567890.123456")
 	}
 }
 
@@ -100,32 +125,32 @@ func TestStripBotMention(t *testing.T) {
 
 func TestNewSlackChannel(t *testing.T) {
 	msgBus := bus.NewMessageBus()
+	bc := &config.Channel{Type: "slack", Enabled: true}
 
 	t.Run("missing bot token", func(t *testing.T) {
-		cfg := config.SlackConfig{}
+		cfg := &config.SlackSettings{}
 		cfg.AppToken = *config.NewSecureString("xapp-test")
-		_, err := NewSlackChannel(cfg, msgBus)
+		_, err := NewSlackChannel(bc, cfg, msgBus)
 		if err == nil {
 			t.Error("expected error for missing bot_token, got nil")
 		}
 	})
 
 	t.Run("missing app token", func(t *testing.T) {
-		cfg := config.SlackConfig{}
+		cfg := &config.SlackSettings{}
 		cfg.BotToken = *config.NewSecureString("xoxb-test")
-		_, err := NewSlackChannel(cfg, msgBus)
+		_, err := NewSlackChannel(bc, cfg, msgBus)
 		if err == nil {
 			t.Error("expected error for missing app_token, got nil")
 		}
 	})
 
 	t.Run("valid config", func(t *testing.T) {
-		cfg := config.SlackConfig{
-			AllowFrom: []string{"U123"},
-		}
+		cfg := &config.SlackSettings{}
 		cfg.BotToken = *config.NewSecureString("xoxb-test")
 		cfg.AppToken = *config.NewSecureString("xapp-test")
-		ch, err := NewSlackChannel(cfg, msgBus)
+		bc := &config.Channel{Type: "slack", Enabled: true, AllowFrom: []string{"U123"}}
+		ch, err := NewSlackChannel(bc, cfg, msgBus)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -142,24 +167,22 @@ func TestSlackChannelIsAllowed(t *testing.T) {
 	msgBus := bus.NewMessageBus()
 
 	t.Run("empty allowlist allows all", func(t *testing.T) {
-		cfg := config.SlackConfig{
-			AllowFrom: []string{},
-		}
+		bc := &config.Channel{Type: config.ChannelSlack, Enabled: true, AllowFrom: []string{}}
+		cfg := &config.SlackSettings{}
 		cfg.BotToken = *config.NewSecureString("xoxb-test")
 		cfg.AppToken = *config.NewSecureString("xapp-test")
-		ch, _ := NewSlackChannel(cfg, msgBus)
+		ch, _ := NewSlackChannel(bc, cfg, msgBus)
 		if !ch.IsAllowed("U_ANYONE") {
 			t.Error("empty allowlist should allow all users")
 		}
 	})
 
 	t.Run("allowlist restricts users", func(t *testing.T) {
-		cfg := config.SlackConfig{
-			AllowFrom: []string{"U_ALLOWED"},
-		}
+		bc := &config.Channel{Type: config.ChannelSlack, Enabled: true, AllowFrom: []string{"U_ALLOWED"}}
+		cfg := &config.SlackSettings{}
 		cfg.BotToken = *config.NewSecureString("xoxb-test")
 		cfg.AppToken = *config.NewSecureString("xapp-test")
-		ch, _ := NewSlackChannel(cfg, msgBus)
+		ch, _ := NewSlackChannel(bc, cfg, msgBus)
 		if !ch.IsAllowed("U_ALLOWED") {
 			t.Error("allowed user should pass allowlist check")
 		}
@@ -167,4 +190,75 @@ func TestSlackChannelIsAllowed(t *testing.T) {
 			t.Error("non-allowed user should be blocked")
 		}
 	})
+}
+
+func TestSendMedia_SendsCaptionFallbackAfterUploads(t *testing.T) {
+	ch := &SlackChannel{
+		BaseChannel: channels.NewBaseChannel("slack", nil, nil, nil),
+	}
+	ch.SetRunning(true)
+
+	store := media.NewFileMediaStore()
+	ch.SetMediaStore(store)
+
+	tmpDir := t.TempDir()
+	localPath := filepath.Join(tmpDir, "report.txt")
+	if err := os.WriteFile(localPath, []byte("attachment body"), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	ref, err := store.Store(localPath, media.MediaMeta{
+		Filename:    "report.txt",
+		ContentType: "text/plain",
+	}, "test-scope")
+	if err != nil {
+		t.Fatalf("Store() error = %v", err)
+	}
+
+	var uploaded []slackUploadRecord
+	var posted []string
+	ch.uploadFileFn = func(ctx context.Context, params slacksdk.UploadFileParameters) error {
+		uploaded = append(uploaded, slackUploadRecord{
+			Channel: params.Channel,
+			Thread:  params.ThreadTimestamp,
+			File:    params.File,
+			Name:    params.Filename,
+			Title:   params.Title,
+		})
+		return nil
+	}
+	ch.postTextFn = func(ctx context.Context, channelID, threadTS, text string) error {
+		posted = append(posted, channelID+"|"+threadTS+"|"+text)
+		return nil
+	}
+
+	_, err = ch.SendMedia(context.Background(), bus.OutboundMediaMessage{
+		ChatID: "C123456/1234567890.123456",
+		Parts: []bus.MediaPart{{
+			Ref:         ref,
+			Type:        "file",
+			Filename:    "report.txt",
+			ContentType: "text/plain",
+			Caption:     "shared caption",
+		}},
+	})
+	if err != nil {
+		t.Fatalf("SendMedia() error = %v", err)
+	}
+	if len(uploaded) != 1 {
+		t.Fatalf("uploads = %v, want 1 upload", uploaded)
+	}
+	if uploaded[0].Title != "shared caption" {
+		t.Fatalf("upload title = %q, want shared caption", uploaded[0].Title)
+	}
+	if len(posted) != 1 || posted[0] != "C123456|1234567890.123456|shared caption" {
+		t.Fatalf("posted = %v, want fallback text in same thread", posted)
+	}
+}
+
+type slackUploadRecord struct {
+	Channel string
+	Thread  string
+	File    string
+	Name    string
+	Title   string
 }

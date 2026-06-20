@@ -22,7 +22,7 @@ import (
 // PicoClientChannel connects to a remote Pico Protocol WebSocket server.
 type PicoClientChannel struct {
 	*channels.BaseChannel
-	config config.PicoClientConfig
+	config *config.PicoClientSettings
 	conn   *picoConn
 	mu     sync.Mutex
 	ctx    context.Context
@@ -31,14 +31,15 @@ type PicoClientChannel struct {
 
 // NewPicoClientChannel creates a new Pico Protocol client channel.
 func NewPicoClientChannel(
-	cfg config.PicoClientConfig,
+	bc *config.Channel,
+	cfg *config.PicoClientSettings,
 	messageBus *bus.MessageBus,
 ) (*PicoClientChannel, error) {
 	if cfg.URL == "" {
 		return nil, fmt.Errorf("pico_client url is required")
 	}
 
-	base := channels.NewBaseChannel("pico_client", cfg, messageBus, cfg.AllowFrom)
+	base := channels.NewBaseChannel("pico_client", cfg, messageBus, bc.AllowFrom)
 
 	return &PicoClientChannel{
 		BaseChannel: base,
@@ -234,6 +235,8 @@ func (c *PicoClientChannel) handleInbound(pc *picoConn, msg PicoMessage) {
 	case TypeMessageCreate:
 		// Server sent us a message — treat as inbound
 		c.handleServerMessage(pc, msg)
+	case TypeMediaCreate:
+		c.handleServerMessage(pc, msg)
 	default:
 		logger.DebugCF("pico_client", "Ignoring message type", map[string]any{
 			"type": msg.Type,
@@ -242,8 +245,22 @@ func (c *PicoClientChannel) handleInbound(pc *picoConn, msg PicoMessage) {
 }
 
 func (c *PicoClientChannel) handleServerMessage(pc *picoConn, msg PicoMessage) {
-	content, _ := msg.Payload["content"].(string)
-	if strings.TrimSpace(content) == "" {
+	if isThoughtPayload(msg.Payload) {
+		return
+	}
+
+	content, _ := msg.Payload[PayloadKeyContent].(string)
+	media, err := parseInlineImageMedia(msg.Payload)
+	if err != nil {
+		logger.WarnCF("pico_client", "Ignoring invalid media payload", map[string]any{
+			"error": err.Error(),
+		})
+		if strings.TrimSpace(content) == "" {
+			return
+		}
+		media = nil
+	}
+	if strings.TrimSpace(content) == "" && len(media) == 0 {
 		return
 	}
 
@@ -254,8 +271,6 @@ func (c *PicoClientChannel) handleServerMessage(pc *picoConn, msg PicoMessage) {
 
 	chatID := "pico_client:" + sessionID
 	senderID := "pico-remote"
-	peer := bus.Peer{Kind: "direct", ID: chatID}
-
 	sender := bus.SenderInfo{
 		Platform:    "pico_client",
 		PlatformID:  senderID,
@@ -266,10 +281,19 @@ func (c *PicoClientChannel) handleServerMessage(pc *picoConn, msg PicoMessage) {
 		return
 	}
 
-	c.HandleMessage(c.ctx, peer, msg.ID, senderID, chatID, content, nil, map[string]string{
-		"platform":   "pico_client",
-		"session_id": sessionID,
-	}, sender)
+	inboundCtx := bus.InboundContext{
+		Channel:   "pico_client",
+		ChatID:    chatID,
+		ChatType:  "direct",
+		SenderID:  senderID,
+		MessageID: msg.ID,
+		Raw: map[string]string{
+			"platform":   "pico_client",
+			"session_id": sessionID,
+		},
+	}
+
+	c.HandleInboundContext(c.ctx, chatID, content, media, inboundCtx, sender)
 }
 
 // Send sends a message to the remote server.
@@ -285,7 +309,7 @@ func (c *PicoClientChannel) Send(ctx context.Context, msg bus.OutboundMessage) (
 	}
 
 	outMsg := newMessage(TypeMessageSend, map[string]any{
-		"content": msg.Content,
+		PayloadKeyContent: msg.Content,
 	})
 	outMsg.SessionID = strings.TrimPrefix(msg.ChatID, "pico_client:")
 	return nil, pc.writeJSON(outMsg)

@@ -417,9 +417,9 @@ func TestEstimateMessageTokens(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := estimateMessageTokens(tt.msg)
+			got := EstimateMessageTokens(tt.msg)
 			if got < tt.want {
-				t.Errorf("estimateMessageTokens() = %d, want >= %d", got, tt.want)
+				t.Errorf("EstimateMessageTokens() = %d, want >= %d", got, tt.want)
 			}
 		})
 	}
@@ -443,8 +443,8 @@ func TestEstimateMessageTokens_ToolCallsContribute(t *testing.T) {
 		},
 	}
 
-	plainTokens := estimateMessageTokens(plain)
-	withTCTokens := estimateMessageTokens(withTC)
+	plainTokens := EstimateMessageTokens(plain)
+	withTCTokens := EstimateMessageTokens(withTC)
 
 	if withTCTokens <= plainTokens {
 		t.Errorf("message with ToolCalls (%d tokens) should exceed plain message (%d tokens)",
@@ -457,7 +457,7 @@ func TestEstimateMessageTokens_MultibyteContent(t *testing.T) {
 	// but may map to different token counts. The heuristic should still produce
 	// reasonable estimates via RuneCountInString.
 	msg := msgUser("caf\u00e9 na\u00efve r\u00e9sum\u00e9 \u00fcber stra\u00dfe")
-	tokens := estimateMessageTokens(msg)
+	tokens := EstimateMessageTokens(msg)
 	if tokens <= 0 {
 		t.Errorf("multibyte message should produce positive token count, got %d", tokens)
 	}
@@ -481,7 +481,7 @@ func TestEstimateMessageTokens_LargeArguments(t *testing.T) {
 		},
 	}
 
-	tokens := estimateMessageTokens(msg)
+	tokens := EstimateMessageTokens(msg)
 	// 5000+ chars → at least 2000 tokens with the 2.5 char/token heuristic
 	if tokens < 2000 {
 		t.Errorf("large tool call arguments should produce significant token count, got %d", tokens)
@@ -496,8 +496,8 @@ func TestEstimateMessageTokens_ReasoningContent(t *testing.T) {
 		ReasoningContent: strings.Repeat("thinking step ", 200),
 	}
 
-	plainTokens := estimateMessageTokens(plain)
-	reasoningTokens := estimateMessageTokens(withReasoning)
+	plainTokens := EstimateMessageTokens(plain)
+	reasoningTokens := EstimateMessageTokens(withReasoning)
 
 	if reasoningTokens <= plainTokens {
 		t.Errorf("message with ReasoningContent (%d tokens) should exceed plain message (%d tokens)",
@@ -513,8 +513,8 @@ func TestEstimateMessageTokens_MediaItems(t *testing.T) {
 		Media:   []string{"media://img1.png", "media://img2.png"},
 	}
 
-	plainTokens := estimateMessageTokens(plain)
-	mediaTokens := estimateMessageTokens(withMedia)
+	plainTokens := EstimateMessageTokens(plain)
+	mediaTokens := EstimateMessageTokens(withMedia)
 
 	if mediaTokens <= plainTokens {
 		t.Errorf("message with Media (%d tokens) should exceed plain message (%d tokens)",
@@ -540,8 +540,8 @@ func TestEstimateMessageTokens_SystemParts(t *testing.T) {
 		},
 	}
 
-	plainTokens := estimateMessageTokens(plain)
-	partsTokens := estimateMessageTokens(withParts)
+	plainTokens := EstimateMessageTokens(plain)
+	partsTokens := EstimateMessageTokens(withParts)
 
 	if partsTokens <= plainTokens {
 		t.Errorf("system message with SystemParts (%d) should exceed plain message (%d)",
@@ -549,7 +549,7 @@ func TestEstimateMessageTokens_SystemParts(t *testing.T) {
 	}
 }
 
-// --- estimateToolDefsTokens tests ---
+// --- EstimateToolDefsTokens tests ---
 
 func TestEstimateToolDefsTokens(t *testing.T) {
 	tests := []struct {
@@ -599,9 +599,9 @@ func TestEstimateToolDefsTokens(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := estimateToolDefsTokens(tt.defs)
+			got := EstimateToolDefsTokens(tt.defs)
 			if got < tt.want {
-				t.Errorf("estimateToolDefsTokens() = %d, want >= %d", got, tt.want)
+				t.Errorf("EstimateToolDefsTokens() = %d, want >= %d", got, tt.want)
 			}
 		})
 	}
@@ -624,8 +624,8 @@ func TestEstimateToolDefsTokens_ScalesWithCount(t *testing.T) {
 		}
 	}
 
-	one := estimateToolDefsTokens([]providers.ToolDefinition{makeTool("tool_a")})
-	three := estimateToolDefsTokens([]providers.ToolDefinition{
+	one := EstimateToolDefsTokens([]providers.ToolDefinition{makeTool("tool_a")})
+	three := EstimateToolDefsTokens([]providers.ToolDefinition{
 		makeTool("tool_a"), makeTool("tool_b"), makeTool("tool_c"),
 	})
 
@@ -770,7 +770,7 @@ func TestEstimateMessageTokens_WithReasoningAndMedia(t *testing.T) {
 		},
 	}
 
-	tokens := estimateMessageTokens(msg)
+	tokens := EstimateMessageTokens(msg)
 
 	// ReasoningContent alone is ~1700 chars → ~680 tokens.
 	// Content + TC + overhead adds more. Should be well above 500.
@@ -781,7 +781,7 @@ func TestEstimateMessageTokens_WithReasoningAndMedia(t *testing.T) {
 	// Compare without reasoning to ensure it's counted.
 	msgNoReasoning := msg
 	msgNoReasoning.ReasoningContent = ""
-	tokensNoReasoning := estimateMessageTokens(msgNoReasoning)
+	tokensNoReasoning := EstimateMessageTokens(msgNoReasoning)
 
 	if tokens <= tokensNoReasoning {
 		t.Errorf("reasoning content should add tokens: with=%d, without=%d", tokens, tokensNoReasoning)
@@ -842,5 +842,66 @@ func TestIsOverContextBudget_RealisticSession(t *testing.T) {
 	// With a tiny context window, should exceed budget.
 	if !isOverContextBudget(500, messages, tools, 32768) {
 		t.Error("realistic session should exceed 500 context window")
+	}
+}
+
+func TestTrimHistoryToFitContextWindow_DropsOldestTurns(t *testing.T) {
+	history := []providers.Message{
+		msgUser(strings.Repeat("u1 ", 120)),
+		msgAssistant(strings.Repeat("a1 ", 120)),
+		msgUser(strings.Repeat("u2 ", 120)),
+		msgAssistant(strings.Repeat("a2 ", 120)),
+		msgUser(strings.Repeat("u3 ", 120)),
+		msgAssistant(strings.Repeat("a3 ", 120)),
+	}
+
+	build := func(history []providers.Message) []providers.Message {
+		return append([]providers.Message(nil), history...)
+	}
+
+	trimmedHistory, messages, fit := trimHistoryToFitContextWindow(
+		history,
+		build,
+		700,
+		nil,
+		0,
+	)
+	if !fit {
+		t.Fatal("expected trimmed history to fit context window")
+	}
+	if len(trimmedHistory) != 4 {
+		t.Fatalf("trimmed history len = %d, want 4", len(trimmedHistory))
+	}
+	if trimmedHistory[0].Content != history[2].Content {
+		t.Fatalf("first kept message = %q, want second turn start", trimmedHistory[0].Content)
+	}
+	if isOverContextBudget(700, messages, nil, 0) {
+		t.Fatal("trimmed messages should be within budget")
+	}
+}
+
+func TestTrimHistoryToFitContextWindow_ClearsSingleOversizedTurn(t *testing.T) {
+	history := []providers.Message{
+		msgUser(strings.Repeat("oversized ", 200)),
+		msgAssistant(strings.Repeat("oversized ", 200)),
+	}
+
+	trimmedHistory, messages, fit := trimHistoryToFitContextWindow(
+		history,
+		func(history []providers.Message) []providers.Message {
+			return append([]providers.Message(nil), history...)
+		},
+		200,
+		nil,
+		0,
+	)
+	if !fit {
+		t.Fatal("expected empty history rebuild to fit context window")
+	}
+	if len(trimmedHistory) != 0 {
+		t.Fatalf("trimmed history len = %d, want 0", len(trimmedHistory))
+	}
+	if len(messages) != 0 {
+		t.Fatalf("messages len = %d, want 0", len(messages))
 	}
 }

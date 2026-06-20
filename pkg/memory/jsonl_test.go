@@ -2,10 +2,14 @@ package memory
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/sipeed/picoclaw/pkg/providers"
 )
@@ -126,6 +130,32 @@ func TestAddFullMessage_WithToolCalls(t *testing.T) {
 	}
 }
 
+func TestAddFullMessage_PreservesModelName(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	msg := providers.Message{
+		Role:      "assistant",
+		Content:   "done",
+		ModelName: "gpt-5.4-mini",
+	}
+
+	if err := store.AddFullMessage(ctx, "model-name", msg); err != nil {
+		t.Fatalf("AddFullMessage: %v", err)
+	}
+
+	history, err := store.GetHistory(ctx, "model-name")
+	if err != nil {
+		t.Fatalf("GetHistory: %v", err)
+	}
+	if len(history) != 1 {
+		t.Fatalf("expected 1, got %d", len(history))
+	}
+	if history[0].ModelName != "gpt-5.4-mini" {
+		t.Fatalf("ModelName = %q, want %q", history[0].ModelName, "gpt-5.4-mini")
+	}
+}
+
 func TestAddFullMessage_ToolCallID(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
@@ -150,6 +180,27 @@ func TestAddFullMessage_ToolCallID(t *testing.T) {
 	}
 	if history[0].ToolCallID != "call_abc" {
 		t.Errorf("ToolCallID = %q", history[0].ToolCallID)
+	}
+}
+
+func TestAddFullMessage_DropsTransientAssistantThought(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	err := store.AddFullMessage(ctx, "transient-thought", providers.Message{
+		Role:             "assistant",
+		ReasoningContent: "internal chain of thought",
+	})
+	if err != nil {
+		t.Fatalf("AddFullMessage: %v", err)
+	}
+
+	history, err := store.GetHistory(ctx, "transient-thought")
+	if err != nil {
+		t.Fatalf("GetHistory: %v", err)
+	}
+	if len(history) != 0 {
+		t.Fatalf("expected transient thought to be discarded, got %d messages", len(history))
 	}
 }
 
@@ -238,6 +289,182 @@ func TestSetSummary_GetSummary(t *testing.T) {
 	}
 	if summary != "updated summary" {
 		t.Errorf("summary = %q", summary)
+	}
+}
+
+func TestSetHistory_DropsTransientAssistantThought(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	newHistory := []providers.Message{
+		{Role: "user", Content: "hello"},
+		{Role: "assistant", ReasoningContent: "internal chain of thought"},
+		{Role: "assistant", Content: "visible answer", ReasoningContent: "visible thought"},
+	}
+
+	err := store.SetHistory(ctx, "replace", newHistory)
+	if err != nil {
+		t.Fatalf("SetHistory: %v", err)
+	}
+
+	history, err := store.GetHistory(ctx, "replace")
+	if err != nil {
+		t.Fatalf("GetHistory: %v", err)
+	}
+	if len(history) != 2 {
+		t.Fatalf("expected transient thought to be removed, got %d messages", len(history))
+	}
+	if history[0].Role != "user" || history[0].Content != "hello" {
+		t.Fatalf("history[0] = %+v, want user/hello", history[0])
+	}
+	if history[1].Role != "assistant" || history[1].Content != "visible answer" ||
+		history[1].ReasoningContent != "visible thought" {
+		t.Fatalf("history[1] = %+v, want assistant visible answer with reasoning", history[1])
+	}
+
+	data, err := os.ReadFile(store.jsonlPath("replace"))
+	if err != nil {
+		t.Fatalf("ReadFile(jsonl): %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("jsonl line count = %d, want 2", len(lines))
+	}
+}
+
+func TestSessionMetaScopeAndAliasesPersist(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	scope := json.RawMessage(`{"version":1,"channel":"telegram","values":{"chat":"group:c1"}}`)
+	aliases := []string{"legacy:one", "legacy:one", "canonical"}
+	if err := store.UpsertSessionMeta(ctx, "canonical", scope, aliases); err != nil {
+		t.Fatalf("UpsertSessionMeta() error = %v", err)
+	}
+
+	meta, err := store.GetSessionMeta(ctx, "canonical")
+	if err != nil {
+		t.Fatalf("GetSessionMeta() error = %v", err)
+	}
+	var gotScope map[string]any
+	if err := json.Unmarshal(meta.Scope, &gotScope); err != nil {
+		t.Fatalf("Unmarshal(meta.Scope) error = %v", err)
+	}
+	var wantScope map[string]any
+	if err := json.Unmarshal(scope, &wantScope); err != nil {
+		t.Fatalf("Unmarshal(scope) error = %v", err)
+	}
+	if !reflect.DeepEqual(gotScope, wantScope) {
+		t.Fatalf("meta.Scope = %#v, want %#v", gotScope, wantScope)
+	}
+	if len(meta.Aliases) != 1 || meta.Aliases[0] != "legacy:one" {
+		t.Fatalf("meta.Aliases = %#v, want [legacy:one]", meta.Aliases)
+	}
+}
+
+func TestResolveSessionKeyByAlias(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	if err := store.AddMessage(ctx, "canonical", "user", "hello"); err != nil {
+		t.Fatalf("AddMessage() error = %v", err)
+	}
+	if err := store.UpsertSessionMeta(ctx, "canonical", nil, []string{"legacy:key"}); err != nil {
+		t.Fatalf("UpsertSessionMeta() error = %v", err)
+	}
+
+	resolved, found, err := store.ResolveSessionKey(ctx, "legacy:key")
+	if err != nil {
+		t.Fatalf("ResolveSessionKey() error = %v", err)
+	}
+	if !found {
+		t.Fatal("ResolveSessionKey() did not find alias")
+	}
+	if resolved != "canonical" {
+		t.Fatalf("resolved = %q, want %q", resolved, "canonical")
+	}
+}
+
+func TestResolveSessionKeyByAlias_PrefersMetadataOverLegacyFile(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	if err := store.AddMessage(ctx, "legacy:key", "user", "legacy"); err != nil {
+		t.Fatalf("AddMessage(legacy) error = %v", err)
+	}
+	if err := store.AddMessage(ctx, "canonical", "user", "canonical"); err != nil {
+		t.Fatalf("AddMessage(canonical) error = %v", err)
+	}
+	if err := store.UpsertSessionMeta(ctx, "canonical", nil, []string{"legacy:key"}); err != nil {
+		t.Fatalf("UpsertSessionMeta() error = %v", err)
+	}
+
+	resolved, found, err := store.ResolveSessionKey(ctx, "legacy:key")
+	if err != nil {
+		t.Fatalf("ResolveSessionKey() error = %v", err)
+	}
+	if !found {
+		t.Fatal("ResolveSessionKey() did not find alias")
+	}
+	if resolved != "canonical" {
+		t.Fatalf("resolved = %q, want %q", resolved, "canonical")
+	}
+}
+
+func TestResolveSessionKey_DirectHitSkipsCorruptMetadata(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	if err := store.AddMessage(ctx, "canonical", "user", "hello"); err != nil {
+		t.Fatalf("AddMessage() error = %v", err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(store.dir, "broken.meta.json"),
+		[]byte("{not-json"),
+		0o644,
+	); err != nil {
+		t.Fatalf("WriteFile(broken.meta.json) error = %v", err)
+	}
+
+	resolved, found, err := store.ResolveSessionKey(ctx, "canonical")
+	if err != nil {
+		t.Fatalf("ResolveSessionKey() error = %v", err)
+	}
+	if !found {
+		t.Fatal("ResolveSessionKey() did not find direct session")
+	}
+	if resolved != "canonical" {
+		t.Fatalf("resolved = %q, want %q", resolved, "canonical")
+	}
+}
+
+func TestResolveSessionKey_SkipsCorruptMetadataDuringAliasScan(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	if err := store.AddMessage(ctx, "canonical", "user", "hello"); err != nil {
+		t.Fatalf("AddMessage() error = %v", err)
+	}
+	if err := store.UpsertSessionMeta(ctx, "canonical", nil, []string{"legacy:key"}); err != nil {
+		t.Fatalf("UpsertSessionMeta() error = %v", err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(store.dir, "broken.meta.json"),
+		[]byte("{not-json"),
+		0o644,
+	); err != nil {
+		t.Fatalf("WriteFile(broken.meta.json) error = %v", err)
+	}
+
+	resolved, found, err := store.ResolveSessionKey(ctx, "legacy:key")
+	if err != nil {
+		t.Fatalf("ResolveSessionKey() error = %v", err)
+	}
+	if !found {
+		t.Fatal("ResolveSessionKey() did not find alias")
+	}
+	if resolved != "canonical" {
+		t.Fatalf("resolved = %q, want %q", resolved, "canonical")
 	}
 }
 
@@ -595,6 +822,56 @@ func TestTruncateHistory_StaleMetaCount(t *testing.T) {
 	}
 }
 
+func TestTruncateHistory_IgnoresTransientThoughtForKeepLast(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	sessionKey := "transient-keep-last"
+	now := time.Now()
+
+	rawJSONL := strings.Join([]string{
+		`{"role":"user","content":"a"}`,
+		`{"role":"assistant","content":"b"}`,
+		`{"role":"assistant","content":"","reasoning_content":"dangling thought"}`,
+		`{"role":"user","content":"c"}`,
+		`{"role":"assistant","content":"d"}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(store.jsonlPath(sessionKey), []byte(rawJSONL), 0o644); err != nil {
+		t.Fatalf("WriteFile(jsonl): %v", err)
+	}
+	if err := store.writeMeta(sessionKey, SessionMeta{
+		Key:       sessionKey,
+		Count:     5,
+		Skip:      0,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("writeMeta: %v", err)
+	}
+
+	if err := store.TruncateHistory(ctx, sessionKey, 2); err != nil {
+		t.Fatalf("TruncateHistory: %v", err)
+	}
+
+	history, err := store.GetHistory(ctx, sessionKey)
+	if err != nil {
+		t.Fatalf("GetHistory: %v", err)
+	}
+	if len(history) != 2 {
+		t.Fatalf("expected 2 retained messages, got %d", len(history))
+	}
+	if history[0].Content != "c" || history[1].Content != "d" {
+		t.Fatalf("kept history = %+v, want c,d", history)
+	}
+
+	meta, err := store.readMeta(sessionKey)
+	if err != nil {
+		t.Fatalf("readMeta: %v", err)
+	}
+	if meta.Skip != 2 {
+		t.Fatalf("meta.Skip = %d, want 2 raw lines skipped", meta.Skip)
+	}
+}
+
 func TestCrashRecovery_PartialLine(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
@@ -778,6 +1055,143 @@ func TestMultipleSessions_Isolation(t *testing.T) {
 	}
 	if len(h2) != 1 || h2[0].Content != "msg for s2" {
 		t.Errorf("s2 history = %+v", h2)
+	}
+}
+
+func TestStore_SetsCreatedAtWhenNil(t *testing.T) {
+	type writeOp struct {
+		name string
+		fn   func(store *JSONLStore, key string) (expectedCount int)
+	}
+
+	ops := []writeOp{
+		{
+			name: "AddMessage",
+			fn: func(store *JSONLStore, key string) int {
+				if err := store.AddMessage(context.Background(), key, "user", "hello"); err != nil {
+					t.Fatalf("AddMessage: %v", err)
+				}
+				return 1
+			},
+		},
+		{
+			name: "AddFullMessage",
+			fn: func(store *JSONLStore, key string) int {
+				if err := store.AddFullMessage(context.Background(), key, providers.Message{
+					Role:    "user",
+					Content: "hello from full",
+				}); err != nil {
+					t.Fatalf("AddFullMessage: %v", err)
+				}
+				return 1
+			},
+		},
+		{
+			name: "SetHistory",
+			fn: func(store *JSONLStore, key string) int {
+				if err := store.SetHistory(context.Background(), key, []providers.Message{
+					{Role: "user", Content: "msg1"},
+					{Role: "assistant", Content: "msg2"},
+				}); err != nil {
+					t.Fatalf("SetHistory: %v", err)
+				}
+				return 2
+			},
+		},
+	}
+
+	for _, op := range ops {
+		t.Run(op.name, func(t *testing.T) {
+			store := newTestStore(t)
+			key := "s1"
+
+			before := time.Now().Add(-time.Second)
+			expectedCount := op.fn(store, key)
+			after := time.Now().Add(time.Second)
+
+			history, err := store.GetHistory(context.Background(), key)
+			if err != nil {
+				t.Fatalf("GetHistory: %v", err)
+			}
+			if len(history) != expectedCount {
+				t.Fatalf("expected %d messages, got %d", expectedCount, len(history))
+			}
+			for i := range history {
+				if history[i].CreatedAt == nil || history[i].CreatedAt.IsZero() {
+					t.Errorf("message %d CreatedAt is zero — not set by %s", i, op.name)
+				}
+				if history[i].CreatedAt.Before(before) || history[i].CreatedAt.After(after) {
+					t.Errorf(
+						"message %d CreatedAt %v outside expected window [%v, %v]",
+						i, history[i].CreatedAt, before, after,
+					)
+				}
+			}
+		})
+	}
+}
+
+func TestStore_PreservesExistingCreatedAt(t *testing.T) {
+	t1 := time.Date(2026, 1, 1, 10, 0, 0, 0, time.UTC)
+	t2 := time.Date(2026, 1, 1, 11, 0, 0, 0, time.UTC)
+
+	type writeOp struct {
+		name      string
+		fn        func(store *JSONLStore, key string)
+		wantTimes []time.Time
+	}
+
+	ops := []writeOp{
+		{
+			name: "AddFullMessage",
+			fn: func(store *JSONLStore, key string) {
+				if err := store.AddFullMessage(context.Background(), key, providers.Message{
+					Role:      "user",
+					Content:   "custom time",
+					CreatedAt: &t1,
+				}); err != nil {
+					t.Fatalf("AddFullMessage: %v", err)
+				}
+			},
+			wantTimes: []time.Time{t1},
+		},
+		{
+			name: "SetHistory",
+			fn: func(store *JSONLStore, key string) {
+				if err := store.SetHistory(context.Background(), key, []providers.Message{
+					{Role: "user", Content: "msg1", CreatedAt: &t1},
+					{Role: "assistant", Content: "msg2", CreatedAt: &t2},
+				}); err != nil {
+					t.Fatalf("SetHistory: %v", err)
+				}
+			},
+			wantTimes: []time.Time{t1, t2},
+		},
+	}
+
+	for _, op := range ops {
+		t.Run(op.name, func(t *testing.T) {
+			store := newTestStore(t)
+			key := "s1"
+
+			op.fn(store, key)
+
+			history, err := store.GetHistory(context.Background(), key)
+			if err != nil {
+				t.Fatalf("GetHistory: %v", err)
+			}
+			if len(history) != len(op.wantTimes) {
+				t.Fatalf("expected %d messages, got %d", len(op.wantTimes), len(history))
+			}
+			for i, want := range op.wantTimes {
+				if history[i].CreatedAt == nil || !history[i].CreatedAt.Equal(want) {
+					t.Errorf(
+						"message %d CreatedAt = %v, want %v (should preserve caller-provided time)",
+						i, history[i].CreatedAt, want,
+					)
+				}
+			}
+		})
 	}
 }
 

@@ -187,14 +187,17 @@ func TestExpandMultiKeyModels_Deduplication(t *testing.T) {
 
 func TestExpandMultiKeyModels_PreservesOtherFields(t *testing.T) {
 	modelCfg := &ModelConfig{
-		ModelName:      "gpt-4",
-		Model:          "openai/gpt-4o",
-		APIBase:        "https://api.example.com",
-		Proxy:          "http://proxy:8080",
-		RPM:            60,
-		MaxTokensField: "max_completion_tokens",
-		RequestTimeout: 30,
-		ThinkingLevel:  "high",
+		ModelName:           "gpt-4",
+		Provider:            "openrouter",
+		Model:               "openai/gpt-4o",
+		APIBase:             "https://api.example.com",
+		Proxy:               "http://proxy:8080",
+		RPM:                 60,
+		MaxTokensField:      "max_completion_tokens",
+		RequestTimeout:      30,
+		ThinkingLevel:       "high",
+		ToolSchemaTransform: "simple",
+		Streaming:           ModelStreamingConfig{Enabled: true},
 	}
 	modelCfg.APIKeys = SimpleSecureStrings("key0", "key1") // Use internal field for multi-key testing
 	models := []*ModelConfig{modelCfg}
@@ -205,6 +208,9 @@ func TestExpandMultiKeyModels_PreservesOtherFields(t *testing.T) {
 	primary := result[1]
 	if primary.APIBase != "https://api.example.com" {
 		t.Errorf("expected api_base preserved, got %q", primary.APIBase)
+	}
+	if primary.Provider != "openrouter" {
+		t.Errorf("expected provider preserved, got %q", primary.Provider)
 	}
 	if primary.Proxy != "http://proxy:8080" {
 		t.Errorf("expected proxy preserved, got %q", primary.Proxy)
@@ -221,14 +227,29 @@ func TestExpandMultiKeyModels_PreservesOtherFields(t *testing.T) {
 	if primary.ThinkingLevel != "high" {
 		t.Errorf("expected thinking_level preserved, got %q", primary.ThinkingLevel)
 	}
+	if primary.ToolSchemaTransform != "simple" {
+		t.Errorf("expected tool_schema_transform preserved, got %q", primary.ToolSchemaTransform)
+	}
+	if !primary.Streaming.Enabled {
+		t.Error("expected streaming config preserved on primary")
+	}
 
 	// Check additional entry also preserves fields
 	additional := result[0]
+	if additional.Provider != "openrouter" {
+		t.Errorf("expected additional provider preserved, got %q", additional.Provider)
+	}
 	if additional.APIBase != "https://api.example.com" {
 		t.Errorf("expected additional api_base preserved, got %q", additional.APIBase)
 	}
 	if additional.RPM != 60 {
 		t.Errorf("expected additional rpm preserved, got %d", additional.RPM)
+	}
+	if additional.ToolSchemaTransform != "simple" {
+		t.Errorf("expected additional tool_schema_transform preserved, got %q", additional.ToolSchemaTransform)
+	}
+	if !additional.Streaming.Enabled {
+		t.Error("expected streaming config preserved on additional")
 	}
 }
 

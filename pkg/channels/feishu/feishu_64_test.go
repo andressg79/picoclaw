@@ -3,9 +3,15 @@
 package feishu
 
 import (
+	"context"
+	"errors"
 	"testing"
 
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
+
+	"github.com/sipeed/picoclaw/pkg/bus"
+	"github.com/sipeed/picoclaw/pkg/channels"
+	"github.com/sipeed/picoclaw/pkg/media"
 )
 
 func TestExtractContent(t *testing.T) {
@@ -176,6 +182,13 @@ func TestAppendMediaTags(t *testing.T) {
 			mediaRefs:   []string{"ref1"},
 			want:        `{"schema":"2.0","body":{"elements":[{"tag":"img","img_key":"img_123"}]}}`,
 		},
+		{
+			name:        "post message with images returns content unchanged",
+			content:     `{"zh_cn":{"title":"","content":[[{"tag":"img","image_key":"img_001"}]]}}`,
+			messageType: "post",
+			mediaRefs:   []string{"ref1"},
+			want:        `{"zh_cn":{"title":"","content":[[{"tag":"img","image_key":"img_001"}]]}}`,
+		},
 	}
 
 	for _, tt := range tests {
@@ -277,5 +290,149 @@ func TestExtractFeishuSenderID(t *testing.T) {
 				t.Errorf("extractFeishuSenderID() = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestFinalizeTrackedToolFeedbackMessage_ClearAfterSuccessfulEdit(t *testing.T) {
+	ch := &FeishuChannel{
+		progress: channels.NewToolFeedbackAnimator(nil),
+	}
+	ch.RecordToolFeedbackMessage("chat-1", "msg-1", "🔧 `read_file`")
+
+	msgIDs, handled := ch.finalizeTrackedToolFeedbackMessage(
+		context.Background(),
+		"chat-1",
+		"final reply",
+		func(_ context.Context, chatID, messageID, content string) error {
+			if chatID != "chat-1" || messageID != "msg-1" || content != "final reply" {
+				t.Fatalf("unexpected edit args: %s %s %s", chatID, messageID, content)
+			}
+			return nil
+		},
+	)
+	if !handled {
+		t.Fatal("expected finalizeTrackedToolFeedbackMessage to handle tracked message")
+	}
+	if len(msgIDs) != 1 || msgIDs[0] != "msg-1" {
+		t.Fatalf("unexpected msgIDs: %v", msgIDs)
+	}
+	if _, ok := ch.currentToolFeedbackMessage("chat-1"); ok {
+		t.Fatal("expected tracked tool feedback to be cleared after successful edit")
+	}
+}
+
+func TestSendMedia_SendsCaptionFallbackAfterMedia(t *testing.T) {
+	ch := &FeishuChannel{
+		BaseChannel: channels.NewBaseChannel("feishu", nil, nil, nil),
+		progress:    channels.NewToolFeedbackAnimator(nil),
+	}
+	ch.SetRunning(true)
+	ch.SetMediaStore(media.NewFileMediaStore())
+
+	var mediaOrder []string
+	var textCalls []string
+	ch.sendMediaPartFn = func(ctx context.Context, chatID string, part bus.MediaPart, store media.MediaStore) error {
+		mediaOrder = append(mediaOrder, part.Type)
+		return nil
+	}
+	ch.sendTextFn = func(ctx context.Context, chatID, text string) (string, error) {
+		textCalls = append(textCalls, chatID+"|"+text)
+		return "msg-1", nil
+	}
+
+	_, err := ch.SendMedia(context.Background(), bus.OutboundMediaMessage{
+		ChatID: "oc_123",
+		Parts: []bus.MediaPart{
+			{Type: "image", Caption: "shared caption"},
+			{Type: "file"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("SendMedia() error = %v", err)
+	}
+	if len(mediaOrder) != 2 {
+		t.Fatalf("media sends = %v, want 2 sends", mediaOrder)
+	}
+	if len(textCalls) != 1 || textCalls[0] != "oc_123|shared caption" {
+		t.Fatalf("textCalls = %v, want [oc_123|shared caption]", textCalls)
+	}
+}
+
+func TestFinalizeTrackedToolFeedbackMessage_StopsTrackingBeforeEdit(t *testing.T) {
+	ch := &FeishuChannel{
+		progress: channels.NewToolFeedbackAnimator(nil),
+	}
+	ch.RecordToolFeedbackMessage("chat-1", "msg-1", "🔧 `read_file`")
+
+	msgIDs, handled := ch.finalizeTrackedToolFeedbackMessage(
+		context.Background(),
+		"chat-1",
+		"final reply",
+		func(_ context.Context, chatID, messageID, content string) error {
+			if _, ok := ch.currentToolFeedbackMessage(chatID); ok {
+				t.Fatal("expected tracked tool feedback to be stopped before edit")
+			}
+			if chatID != "chat-1" || messageID != "msg-1" || content != "final reply" {
+				t.Fatalf("unexpected edit args: %s %s %s", chatID, messageID, content)
+			}
+			return nil
+		},
+	)
+	if !handled {
+		t.Fatal("expected finalizeTrackedToolFeedbackMessage to handle tracked message")
+	}
+	if len(msgIDs) != 1 || msgIDs[0] != "msg-1" {
+		t.Fatalf("unexpected msgIDs: %v", msgIDs)
+	}
+}
+
+func TestFinalizeTrackedToolFeedbackMessage_EditFailureKeepsTrackedMessage(t *testing.T) {
+	ch := &FeishuChannel{
+		progress: channels.NewToolFeedbackAnimator(nil),
+	}
+	ch.RecordToolFeedbackMessage("chat-1", "msg-1", "🔧 `read_file`")
+
+	msgIDs, handled := ch.finalizeTrackedToolFeedbackMessage(
+		context.Background(),
+		"chat-1",
+		"final reply",
+		func(context.Context, string, string, string) error {
+			return errors.New("edit failed")
+		},
+	)
+	if handled {
+		t.Fatal("expected finalizeTrackedToolFeedbackMessage to report unhandled on edit failure")
+	}
+	if len(msgIDs) != 0 {
+		t.Fatalf("unexpected msgIDs: %v", msgIDs)
+	}
+	if msgID, ok := ch.currentToolFeedbackMessage("chat-1"); !ok || msgID != "msg-1" {
+		t.Fatalf("expected tracked tool feedback to remain after failed edit, got (%q, %v)", msgID, ok)
+	}
+}
+
+func TestResetTrackedToolFeedbackAfterEditFailure_DismissesTrackedMessage(t *testing.T) {
+	var (
+		deletedChatID string
+		deletedMsgID  string
+	)
+
+	ch := &FeishuChannel{
+		progress: channels.NewToolFeedbackAnimator(nil),
+		deleteMessageFn: func(_ context.Context, chatID, messageID string) error {
+			deletedChatID = chatID
+			deletedMsgID = messageID
+			return nil
+		},
+	}
+	ch.RecordToolFeedbackMessage("chat-1", "msg-1", "🔧 `read_file`")
+
+	ch.resetTrackedToolFeedbackAfterEditFailure(context.Background(), "chat-1")
+
+	if deletedChatID != "chat-1" || deletedMsgID != "msg-1" {
+		t.Fatalf("unexpected delete target: chat=%q msg=%q", deletedChatID, deletedMsgID)
+	}
+	if _, ok := ch.currentToolFeedbackMessage("chat-1"); ok {
+		t.Fatal("expected tracked tool feedback to be cleared after edit failure reset")
 	}
 }

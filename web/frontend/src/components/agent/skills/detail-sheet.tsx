@@ -7,11 +7,16 @@ import {
 import type { ReactNode } from "react"
 import { useTranslation } from "react-i18next"
 import ReactMarkdown from "react-markdown"
+import rehypeHighlight from "rehype-highlight"
 import rehypeRaw from "rehype-raw"
 import rehypeSanitize from "rehype-sanitize"
 import remarkGfm from "remark-gfm"
 
 import type { SkillDetailResponse, SkillSupportItem } from "@/api/skills"
+import {
+  MarkdownCodeBlock,
+  MessageCodeBlock,
+} from "@/components/chat/message-code-block"
 import {
   Sheet,
   SheetContent,
@@ -23,10 +28,7 @@ import { Skeleton } from "@/components/ui/skeleton"
 import { cn } from "@/lib/utils"
 
 import { OriginBadge } from "./origin-badge"
-import {
-  getOriginLabel,
-  getSkillOriginKind,
-} from "./origin-utils"
+import { getOriginLabel, getSkillOriginKind } from "./origin-utils"
 import type { SkillDetailView } from "./types"
 
 const DETAIL_VIEWS = [
@@ -86,7 +88,8 @@ export function DetailSheet({
             </div>
             <div className="min-w-0 flex-1 space-y-1 text-left">
               <SheetTitle className="truncate text-xl font-bold tracking-tight">
-                {activeSkillDetail?.name || t("pages.agent.skills.viewer_title")}
+                {activeSkillDetail?.name ||
+                  t("pages.agent.skills.viewer_title")}
               </SheetTitle>
               <SheetDescription className="line-clamp-2">
                 {activeSkillDetail?.description ||
@@ -173,10 +176,13 @@ export function DetailSheet({
               </div>
 
               {detailView === "preview" ? (
-                <div className="prose prose-zinc dark:prose-invert prose-sm sm:prose-base prose-pre:rounded-xl prose-pre:border prose-pre:border-border/40 prose-pre:bg-zinc-950/90 prose-pre:shadow-sm prose-headings:tracking-tight prose-a:text-primary prose-a:no-underline hover:prose-a:underline max-w-none">
+                <div className="prose prose-zinc dark:prose-invert prose-sm sm:prose-base prose-pre:rounded-xl prose-pre:border prose-pre:border-border/40 prose-pre:bg-zinc-100 prose-pre:p-0 prose-pre:shadow-sm dark:prose-pre:bg-zinc-950/90 prose-headings:tracking-tight prose-a:text-primary prose-a:no-underline hover:prose-a:underline max-w-none">
                   <ReactMarkdown
                     remarkPlugins={[remarkGfm]}
-                    rehypePlugins={[rehypeRaw, rehypeSanitize]}
+                    rehypePlugins={[rehypeRaw, rehypeSanitize, rehypeHighlight]}
+                    components={{
+                      pre: MarkdownCodeBlock,
+                    }}
                   >
                     {selectedSkillDetail.content}
                   </ReactMarkdown>
@@ -184,11 +190,12 @@ export function DetailSheet({
               ) : null}
 
               {detailView === "raw" ? (
-                <div className="border-border/50 overflow-x-auto rounded-xl border bg-zinc-950 p-5 shadow-sm">
-                  <pre className="font-mono text-[13px] leading-relaxed break-words whitespace-pre-wrap text-zinc-100/90">
-                    <code>{selectedSkillDetail.content}</code>
-                  </pre>
-                </div>
+                <MessageCodeBlock
+                  code={selectedSkillDetail.content}
+                  label={t("pages.agent.skills.detail_tabs.raw")}
+                  className="my-0"
+                  bodyClassName="text-[13px] leading-relaxed"
+                />
               ) : null}
 
               {detailView === "meta" ? (

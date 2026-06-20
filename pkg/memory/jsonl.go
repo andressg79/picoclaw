@@ -4,18 +4,22 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/sipeed/picoclaw/pkg/fileutil"
 	"github.com/sipeed/picoclaw/pkg/providers"
+	"github.com/sipeed/picoclaw/pkg/providers/messageutil"
 )
 
 const (
@@ -32,14 +36,19 @@ const (
 	maxLineSize = 10 * 1024 * 1024 // 10 MB
 )
 
-// sessionMeta holds per-session metadata stored in a .meta.json file.
-type sessionMeta struct {
-	Key       string    `json:"key"`
-	Summary   string    `json:"summary"`
-	Skip      int       `json:"skip"`
-	Count     int       `json:"count"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+// SessionMeta holds per-session metadata stored in a .meta.json file.
+//
+// Scope is stored as raw JSON so pkg/memory can stay decoupled from the
+// higher-level session package while still preserving structured scope data.
+type SessionMeta struct {
+	Key       string          `json:"key"`
+	Summary   string          `json:"summary"`
+	Skip      int             `json:"skip"`
+	Count     int             `json:"count"`
+	CreatedAt time.Time       `json:"created_at"`
+	UpdatedAt time.Time       `json:"updated_at"`
+	Scope     json.RawMessage `json:"scope,omitempty"`
+	Aliases   []string        `json:"aliases,omitempty"`
 }
 
 // JSONLStore implements Store using append-only JSONL files.
@@ -98,30 +107,377 @@ func sanitizeKey(key string) string {
 
 // readMeta loads the metadata file for a session.
 // Returns a zero-value sessionMeta if the file does not exist.
-func (s *JSONLStore) readMeta(key string) (sessionMeta, error) {
+func (s *JSONLStore) readMeta(key string) (SessionMeta, error) {
 	data, err := os.ReadFile(s.metaPath(key))
 	if os.IsNotExist(err) {
-		return sessionMeta{Key: key}, nil
+		return SessionMeta{Key: key}, nil
 	}
 	if err != nil {
-		return sessionMeta{}, fmt.Errorf("memory: read meta: %w", err)
+		return SessionMeta{}, fmt.Errorf("memory: read meta: %w", err)
 	}
-	var meta sessionMeta
+	var meta SessionMeta
 	err = json.Unmarshal(data, &meta)
 	if err != nil {
-		return sessionMeta{}, fmt.Errorf("memory: decode meta: %w", err)
+		return SessionMeta{}, fmt.Errorf("memory: decode meta: %w", err)
+	}
+	if meta.Key == "" {
+		meta.Key = key
 	}
 	return meta, nil
 }
 
 // writeMeta atomically writes the metadata file using the project's
 // standard WriteFileAtomic (temp + fsync + rename).
-func (s *JSONLStore) writeMeta(key string, meta sessionMeta) error {
+func (s *JSONLStore) writeMeta(key string, meta SessionMeta) error {
+	if strings.TrimSpace(meta.Key) == "" {
+		meta.Key = key
+	}
 	data, err := json.MarshalIndent(meta, "", "  ")
 	if err != nil {
 		return fmt.Errorf("memory: encode meta: %w", err)
 	}
 	return fileutil.WriteFileAtomic(s.metaPath(key), data, 0o644)
+}
+
+func cloneRawJSON(data json.RawMessage) json.RawMessage {
+	if len(data) == 0 {
+		return nil
+	}
+	return append(json.RawMessage(nil), data...)
+}
+
+func normalizeAliases(canonicalKey string, aliases []string) []string {
+	if len(aliases) == 0 {
+		return nil
+	}
+	normalized := make([]string, 0, len(aliases))
+	seen := make(map[string]struct{}, len(aliases))
+	canonicalKey = strings.TrimSpace(canonicalKey)
+	for _, alias := range aliases {
+		alias = strings.TrimSpace(alias)
+		if alias == "" || alias == canonicalKey {
+			continue
+		}
+		if _, ok := seen[alias]; ok {
+			continue
+		}
+		seen[alias] = struct{}{}
+		normalized = append(normalized, alias)
+	}
+	if len(normalized) == 0 {
+		return nil
+	}
+	return normalized
+}
+
+func (s *JSONLStore) sessionExists(key string) bool {
+	if key == "" {
+		return false
+	}
+	if _, err := os.Stat(s.jsonlPath(key)); err == nil {
+		return true
+	}
+	if _, err := os.Stat(s.metaPath(key)); err == nil {
+		return true
+	}
+	return false
+}
+
+// GetSessionMeta returns the current metadata snapshot for sessionKey.
+func (s *JSONLStore) GetSessionMeta(_ context.Context, sessionKey string) (SessionMeta, error) {
+	l := s.sessionLock(sessionKey)
+	l.Lock()
+	defer l.Unlock()
+
+	meta, err := s.readMeta(sessionKey)
+	if err != nil {
+		return SessionMeta{}, err
+	}
+	meta.Scope = cloneRawJSON(meta.Scope)
+	if len(meta.Aliases) > 0 {
+		meta.Aliases = append([]string(nil), meta.Aliases...)
+	}
+	return meta, nil
+}
+
+// UpsertSessionMeta stores structured session metadata while preserving
+// summary/count/skip timestamps maintained by the core JSONL store.
+func (s *JSONLStore) UpsertSessionMeta(
+	_ context.Context,
+	sessionKey string,
+	scope json.RawMessage,
+	aliases []string,
+) error {
+	l := s.sessionLock(sessionKey)
+	l.Lock()
+	defer l.Unlock()
+
+	meta, err := s.readMeta(sessionKey)
+	if err != nil {
+		return err
+	}
+	meta.Scope = cloneRawJSON(scope)
+	meta.Aliases = normalizeAliases(sessionKey, aliases)
+	now := time.Now()
+	if meta.CreatedAt.IsZero() {
+		meta.CreatedAt = now
+	}
+	meta.UpdatedAt = now
+
+	return s.writeMeta(sessionKey, meta)
+}
+
+// PromoteAliasHistory atomically promotes the first non-empty alias session
+// into the canonical session when the canonical session is still empty.
+//
+// Main-session aliases (e.g. "agent:main:main" or its opaque form) are
+// skipped during promotion.  The main session is a shared global fallback
+// and promoting its history into individual sessions would attach stale
+// messages to every new Web UI session (issue #2972).
+func (s *JSONLStore) PromoteAliasHistory(
+	_ context.Context,
+	sessionKey string,
+	scope json.RawMessage,
+	aliases []string,
+) (bool, error) {
+	sessionKey = strings.TrimSpace(sessionKey)
+	if sessionKey == "" {
+		return false, nil
+	}
+
+	aliases = normalizeAliases(sessionKey, aliases)
+	for _, alias := range aliases {
+		if isMainSessionAlias(alias) {
+			continue
+		}
+		unlock := s.lockSessionPair(sessionKey, alias)
+		promoted, err := s.promoteAliasHistoryLocked(sessionKey, alias, scope, aliases)
+		unlock()
+		if err != nil || promoted {
+			return promoted, err
+		}
+	}
+
+	return false, nil
+}
+
+// isMainSessionAlias reports whether alias is the legacy or opaque main-session
+// key.  The main session ("agent:<agent>:main") is a shared fallback and should
+// not have its history promoted into individual per-channel sessions.
+func isMainSessionAlias(alias string) bool {
+	if alias == "" {
+		return false
+	}
+	// Legacy form: "agent:main:main" (exactly 3 colon-separated parts)
+	// Must not match "agent:sales:direct:main" etc.
+	if strings.HasPrefix(alias, "agent:") && strings.HasSuffix(alias, ":main") {
+		parts := strings.SplitN(alias, ":", 4)
+		if len(parts) == 3 {
+			return true
+		}
+	}
+	// Opaque form: "sk_v1_" + SHA256("agent:main:main")
+	if strings.HasPrefix(alias, "sk_v1_") {
+		for _, agentID := range []string{"main", "Main", "MAIN"} {
+			legacy := "agent:" + agentID + ":main"
+			hash := sha256.Sum256([]byte(legacy))
+			if "sk_v1_"+hex.EncodeToString(hash[:]) == alias {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// ResolveSessionKey returns the canonical session key for a candidate key.
+// It short-circuits direct canonical keys when possible, then scans metadata
+// once to resolve aliases or canonical metadata keys.
+func (s *JSONLStore) ResolveSessionKey(_ context.Context, sessionKey string) (string, bool, error) {
+	sessionKey = strings.TrimSpace(sessionKey)
+	if sessionKey == "" {
+		return "", false, nil
+	}
+
+	hasDirectSession := s.sessionExists(sessionKey)
+	if hasDirectSession && shouldShortCircuitSessionResolve(sessionKey) {
+		return sessionKey, true, nil
+	}
+
+	entries, err := os.ReadDir(s.dir)
+	if err != nil {
+		return "", false, fmt.Errorf("memory: read sessions dir: %w", err)
+	}
+
+	var directMetaMatch string
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".meta.json") {
+			continue
+		}
+
+		data, readErr := os.ReadFile(filepath.Join(s.dir, entry.Name()))
+		if readErr != nil {
+			log.Printf("memory: skipping unreadable meta %s: %v", entry.Name(), readErr)
+			continue
+		}
+
+		var meta SessionMeta
+		if err := json.Unmarshal(data, &meta); err != nil {
+			log.Printf("memory: skipping corrupt meta %s: %v", entry.Name(), err)
+			continue
+		}
+
+		if meta.Key == "" {
+			continue
+		}
+
+		if meta.Key == sessionKey {
+			directMetaMatch = meta.Key
+		}
+
+		for _, alias := range meta.Aliases {
+			if alias == sessionKey && meta.Key != sessionKey {
+				return meta.Key, true, nil
+			}
+		}
+	}
+
+	if directMetaMatch != "" {
+		return directMetaMatch, true, nil
+	}
+
+	if hasDirectSession {
+		return sessionKey, true, nil
+	}
+
+	return "", false, nil
+}
+
+func shouldShortCircuitSessionResolve(sessionKey string) bool {
+	sessionKey = strings.TrimSpace(strings.ToLower(sessionKey))
+	if sessionKey == "" {
+		return false
+	}
+	return !strings.ContainsAny(sessionKey, ":/\\")
+}
+
+func (s *JSONLStore) lockSessionPair(keyA, keyB string) func() {
+	lockA := s.sessionLock(keyA)
+	lockB := s.sessionLock(keyB)
+	if lockA == lockB {
+		lockA.Lock()
+		return func() { lockA.Unlock() }
+	}
+	if keyA <= keyB {
+		lockA.Lock()
+		lockB.Lock()
+		return func() {
+			lockB.Unlock()
+			lockA.Unlock()
+		}
+	}
+	lockB.Lock()
+	lockA.Lock()
+	return func() {
+		lockA.Unlock()
+		lockB.Unlock()
+	}
+}
+
+func (s *JSONLStore) promoteAliasHistoryLocked(
+	sessionKey string,
+	alias string,
+	scope json.RawMessage,
+	aliases []string,
+) (bool, error) {
+	canonicalMeta, err := s.readMeta(sessionKey)
+	if err != nil {
+		return false, err
+	}
+	canonicalHasContent, err := s.sessionHasVisibleContentLocked(sessionKey, canonicalMeta)
+	if err != nil {
+		return false, err
+	}
+	if canonicalHasContent {
+		return false, nil
+	}
+
+	aliasMeta, err := s.readMeta(alias)
+	if err != nil {
+		return false, err
+	}
+	aliasHistory, err := readMessages(s.jsonlPath(alias), aliasMeta.Skip)
+	if err != nil {
+		return false, err
+	}
+	aliasSummary := strings.TrimSpace(aliasMeta.Summary)
+	if len(aliasHistory) == 0 && aliasSummary == "" {
+		return false, nil
+	}
+
+	previousJSONL, hadPreviousJSONL, err := s.readRawJSONL(sessionKey)
+	if err != nil {
+		return false, err
+	}
+
+	now := time.Now()
+	if canonicalMeta.CreatedAt.IsZero() {
+		canonicalMeta.CreatedAt = now
+	}
+	canonicalMeta.Scope = cloneRawJSON(scope)
+	canonicalMeta.Aliases = normalizeAliases(sessionKey, aliases)
+	canonicalMeta.Skip = 0
+	canonicalMeta.Count = len(aliasHistory)
+	canonicalMeta.UpdatedAt = now
+	if aliasSummary != "" {
+		canonicalMeta.Summary = aliasSummary
+	}
+
+	if err := s.rewriteJSONL(sessionKey, aliasHistory); err != nil {
+		return false, err
+	}
+	if err := s.writeMeta(sessionKey, canonicalMeta); err != nil {
+		if rollbackErr := s.restoreRawJSONL(sessionKey, previousJSONL, hadPreviousJSONL); rollbackErr != nil {
+			return false, fmt.Errorf("memory: write promoted meta: %w (rollback jsonl: %v)", err, rollbackErr)
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+func (s *JSONLStore) sessionHasVisibleContentLocked(sessionKey string, meta SessionMeta) (bool, error) {
+	if strings.TrimSpace(meta.Summary) != "" {
+		return true, nil
+	}
+	history, err := readMessages(s.jsonlPath(sessionKey), meta.Skip)
+	if err != nil {
+		return false, err
+	}
+	return len(history) > 0, nil
+}
+
+func (s *JSONLStore) readRawJSONL(sessionKey string) ([]byte, bool, error) {
+	data, err := os.ReadFile(s.jsonlPath(sessionKey))
+	if os.IsNotExist(err) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, fmt.Errorf("memory: read jsonl: %w", err)
+	}
+	return data, true, nil
+}
+
+func (s *JSONLStore) restoreRawJSONL(sessionKey string, data []byte, existed bool) error {
+	path := s.jsonlPath(sessionKey)
+	if !existed {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("memory: remove jsonl rollback: %w", err)
+		}
+		return nil
+	}
+	if err := fileutil.WriteFileAtomic(path, data, 0o644); err != nil {
+		return fmt.Errorf("memory: restore jsonl rollback: %w", err)
+	}
+	return nil
 }
 
 // readMessages reads valid JSON lines from a .jsonl file, skipping
@@ -163,6 +519,9 @@ func readMessages(path string, skip int) ([]providers.Message, error) {
 				lineNum, filepath.Base(path), err)
 			continue
 		}
+		if messageutil.IsTransientAssistantThoughtMessage(msg) {
+			continue
+		}
 		msgs = append(msgs, msg)
 	}
 	if scanner.Err() != nil {
@@ -175,28 +534,44 @@ func readMessages(path string, skip int) ([]providers.Message, error) {
 	return msgs, nil
 }
 
-// countLines counts the total number of non-empty lines in a .jsonl file.
-// Used by TruncateHistory to reconcile a stale meta.Count without
-// the overhead of unmarshaling every message.
-func countLines(path string) (int, error) {
+// scanRetainedMessageLines returns the total number of non-empty raw JSONL
+// lines plus the raw line numbers that survive readMessages filtering.
+// TruncateHistory uses this to compute keepLast against retained messages
+// while preserving the raw-line skip offset stored in metadata.
+func scanRetainedMessageLines(path string) (int, []int, error) {
 	f, err := os.Open(path)
 	if os.IsNotExist(err) {
-		return 0, nil
+		return 0, []int{}, nil
 	}
 	if err != nil {
-		return 0, fmt.Errorf("memory: open jsonl: %w", err)
+		return 0, nil, fmt.Errorf("memory: open jsonl: %w", err)
 	}
 	defer f.Close()
 
-	n := 0
+	rawCount := 0
+	retained := make([]int, 0)
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 0, 64*1024), maxLineSize)
 	for scanner.Scan() {
-		if len(scanner.Bytes()) > 0 {
-			n++
+		line := scanner.Bytes()
+		if len(line) == 0 {
+			continue
 		}
+		rawCount++
+
+		var msg providers.Message
+		if err := json.Unmarshal(line, &msg); err != nil {
+			continue
+		}
+		if messageutil.IsTransientAssistantThoughtMessage(msg) {
+			continue
+		}
+		retained = append(retained, rawCount)
 	}
-	return n, scanner.Err()
+	if err := scanner.Err(); err != nil {
+		return 0, nil, err
+	}
+	return rawCount, retained, nil
 }
 
 func (s *JSONLStore) AddMessage(
@@ -216,9 +591,19 @@ func (s *JSONLStore) AddFullMessage(
 
 // addMsg is the shared implementation for AddMessage and AddFullMessage.
 func (s *JSONLStore) addMsg(sessionKey string, msg providers.Message) error {
+	if messageutil.IsTransientAssistantThoughtMessage(msg) {
+		return nil
+	}
+
 	l := s.sessionLock(sessionKey)
 	l.Lock()
 	defer l.Unlock()
+
+	now := time.Now()
+
+	if msg.CreatedAt == nil {
+		msg.CreatedAt = &now
+	}
 
 	// Append the message as a single JSON line.
 	line, err := json.Marshal(msg)
@@ -257,7 +642,6 @@ func (s *JSONLStore) addMsg(sessionKey string, msg providers.Message) error {
 	if err != nil {
 		return err
 	}
-	now := time.Now()
 	if meta.Count == 0 && meta.CreatedAt.IsZero() {
 		meta.CreatedAt = now
 	}
@@ -336,24 +720,26 @@ func (s *JSONLStore) TruncateHistory(
 		return err
 	}
 
-	// Always reconcile meta.Count with the actual line count on disk.
-	// A crash between the JSONL append and the meta update in addMsg
-	// leaves meta.Count stale (e.g. file has 101 lines but meta says
-	// 100). Counting lines is cheap — no unmarshal, just a scan — and
-	// TruncateHistory is not a hot path, so always re-count.
-	n, countErr := countLines(s.jsonlPath(sessionKey))
-	if countErr != nil {
-		return countErr
+	rawCount, retainedRawLines, scanErr := scanRetainedMessageLines(s.jsonlPath(sessionKey))
+	if scanErr != nil {
+		return scanErr
 	}
-	meta.Count = n
-
-	if keepLast <= 0 {
+	meta.Count = rawCount
+	if meta.Skip > meta.Count {
 		meta.Skip = meta.Count
-	} else {
-		effective := meta.Count - meta.Skip
-		if keepLast < effective {
-			meta.Skip = meta.Count - keepLast
-		}
+	}
+
+	activeStart := sort.Search(len(retainedRawLines), func(i int) bool {
+		return retainedRawLines[i] > meta.Skip
+	})
+	activeRetainedCount := len(retainedRawLines) - activeStart
+
+	switch {
+	case keepLast <= 0 || activeRetainedCount == 0:
+		meta.Skip = meta.Count
+	case keepLast < activeRetainedCount:
+		activeRawLines := retainedRawLines[activeStart:]
+		meta.Skip = activeRawLines[activeRetainedCount-keepLast-1]
 	}
 	meta.UpdatedAt = time.Now()
 
@@ -365,6 +751,8 @@ func (s *JSONLStore) SetHistory(
 	sessionKey string,
 	history []providers.Message,
 ) error {
+	history = messageutil.FilterInvalidHistoryMessages(history)
+
 	l := s.sessionLock(sessionKey)
 	l.Lock()
 	defer l.Unlock()
@@ -380,6 +768,12 @@ func (s *JSONLStore) SetHistory(
 	meta.Skip = 0
 	meta.Count = len(history)
 	meta.UpdatedAt = now
+
+	for i := range history {
+		if history[i].CreatedAt == nil {
+			history[i].CreatedAt = &now
+		}
+	}
 
 	// Write meta BEFORE rewriting the JSONL file. If we crash between
 	// the two writes, meta has Skip=0 and the old file is still intact,
@@ -443,6 +837,8 @@ func (s *JSONLStore) Compact(
 func (s *JSONLStore) rewriteJSONL(
 	sessionKey string, msgs []providers.Message,
 ) error {
+	msgs = messageutil.FilterInvalidHistoryMessages(msgs)
+
 	var buf bytes.Buffer
 	for i, msg := range msgs {
 		line, err := json.Marshal(msg)
@@ -453,6 +849,33 @@ func (s *JSONLStore) rewriteJSONL(
 		buf.WriteByte('\n')
 	}
 	return fileutil.WriteFileAtomic(s.jsonlPath(sessionKey), buf.Bytes(), 0o644)
+}
+
+// ListSessions returns all known session keys by reading .meta.json files.
+func (s *JSONLStore) ListSessions() []string {
+	entries, err := os.ReadDir(s.dir)
+	if err != nil {
+		return nil
+	}
+	var keys []string
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".meta.json") {
+			continue
+		}
+		// Read the meta file to get the original key
+		data, err := os.ReadFile(filepath.Join(s.dir, entry.Name()))
+		if err != nil {
+			continue
+		}
+		var meta SessionMeta
+		if err := json.Unmarshal(data, &meta); err != nil {
+			continue
+		}
+		if meta.Key != "" {
+			keys = append(keys, meta.Key)
+		}
+	}
+	return keys
 }
 
 func (s *JSONLStore) Close() error {

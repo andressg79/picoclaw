@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -20,6 +21,8 @@ import (
 
 	"github.com/sipeed/picoclaw/pkg/config"
 	"github.com/sipeed/picoclaw/pkg/constants"
+	"github.com/sipeed/picoclaw/pkg/isolation"
+	"github.com/sipeed/picoclaw/pkg/logger"
 )
 
 var (
@@ -96,6 +99,26 @@ var (
 		regexp.MustCompile(`\bsource\s+.*\.sh\b`),
 	}
 
+	// windowsDenyPatterns contains PowerShell-specific deny patterns that only
+	// apply on Windows, where commands are executed via powershell -Command.
+	windowsDenyPatterns = []*regexp.Regexp{
+		// [Text.Encoding] used to construct command strings at runtime.
+		// Matches [Text.Encoding] and [System.Text.Encoding] variants.
+		regexp.MustCompile(`\[(?:\w+\.)?text\.encoding\]`),
+		// PowerShell -EncodedCommand flag (base64-encoded command) and all short forms.
+		// Matches: -e, -ec, -enc, -en, -EncodedCommand (all with space prefix)
+		regexp.MustCompile(` -e(?:$|\s)| -ec(?:$|\s)| -enc(?:$|\s)| -en(?:$|\s)| -encodedcommand\b`),
+		// .GetString called on byte array to decode commands.
+		regexp.MustCompile(`\.getstring\s*\(\s*\[byte\[\]`),
+		// FromBase64String used in command construction chain.
+		regexp.MustCompile(`frombase64string\(`),
+		// PowerShell variable holding byte array used in GetString.
+		regexp.MustCompile(`\$[a-zA-Z_]\w*\s*=\s*\[byte\[\]`),
+		// Unicode escape sequences that could be used to construct commands.
+		// Matches \uXXXX format used to represent characters like i = "i"
+		regexp.MustCompile(`\\u[0-9a-fA-F]{4}`),
+	}
+
 	// absolutePathPattern matches absolute file paths in commands (Unix and Windows).
 	absolutePathPattern = regexp.MustCompile(`[A-Za-z]:\\[^\\\"']+|/[^\s\"']+`)
 
@@ -120,7 +143,7 @@ func NewExecTool(workingDir string, restrict bool, allowPaths ...[]*regexp.Regex
 func NewExecToolWithConfig(
 	workingDir string,
 	restrict bool,
-	config *config.Config,
+	cfg *config.Config,
 	allowPaths ...[]*regexp.Regexp,
 ) (*ExecTool, error) {
 	denyPatterns := make([]*regexp.Regexp, 0)
@@ -131,14 +154,19 @@ func NewExecToolWithConfig(
 		allowedPathPatterns = allowPaths[0]
 	}
 
-	if config != nil {
-		execConfig := config.Tools.Exec
+	if cfg != nil {
+		execConfig := cfg.Tools.Exec
 		enableDenyPatterns := execConfig.EnableDenyPatterns
 		allowRemote = execConfig.AllowRemote
 		if enableDenyPatterns {
 			denyPatterns = append(denyPatterns, defaultDenyPatterns...)
+			if runtime.GOOS == "windows" {
+				denyPatterns = append(denyPatterns, windowsDenyPatterns...)
+			}
 			if len(execConfig.CustomDenyPatterns) > 0 {
-				fmt.Printf("Using custom deny patterns: %v\n", execConfig.CustomDenyPatterns)
+				logger.InfoCF("tools", "using custom deny patterns", map[string]any{
+					"patterns": execConfig.CustomDenyPatterns,
+				})
 				for _, pattern := range execConfig.CustomDenyPatterns {
 					re, err := regexp.Compile(pattern)
 					if err != nil {
@@ -149,7 +177,7 @@ func NewExecToolWithConfig(
 			}
 		} else {
 			// If deny patterns are disabled, we won't add any patterns, allowing all commands.
-			fmt.Println("Warning: deny patterns are disabled. All commands will be allowed.")
+			logger.WarnCF("tools", "deny patterns are disabled, all commands will be allowed", nil)
 		}
 		for _, pattern := range execConfig.CustomAllowPatterns {
 			re, err := regexp.Compile(pattern)
@@ -160,11 +188,14 @@ func NewExecToolWithConfig(
 		}
 	} else {
 		denyPatterns = append(denyPatterns, defaultDenyPatterns...)
+		if runtime.GOOS == "windows" {
+			denyPatterns = append(denyPatterns, windowsDenyPatterns...)
+		}
 	}
 
 	var timeout time.Duration
-	if config != nil && config.Tools.Exec.TimeoutSeconds > 0 {
-		timeout = time.Duration(config.Tools.Exec.TimeoutSeconds) * time.Second
+	if cfg != nil && cfg.Tools.Exec.TimeoutSeconds > 0 {
+		timeout = time.Duration(cfg.Tools.Exec.TimeoutSeconds) * time.Second
 	}
 
 	return &ExecTool{
@@ -188,6 +219,7 @@ func (t *ExecTool) Description() string {
 	return `Execute shell commands. Use background=true for long-running commands (returns sessionId). Use pty=true for interactive commands (can combine with background=true). Use poll/read/write/send-keys/kill with sessionId to manage background sessions. Sessions auto-cleanup 30 minutes after process exits; use kill to terminate early. Output buffer limit: 1MB.`
 }
 
+//nolint:dupl // Tool parameter schemas intentionally use similar JSON-schema map literals.
 func (t *ExecTool) Parameters() map[string]any {
 	return map[string]any{
 		"type": "object",
@@ -378,12 +410,24 @@ func (t *ExecTool) runSync(ctx context.Context, command, cwd string) *ToolResult
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
-	if err := cmd.Start(); err != nil {
+	// Route shell execution through the shared isolation entry point so exec tool
+	// subprocesses receive the same isolation policy as other integrations.
+	if err := isolation.Start(cmd); err != nil {
 		return ErrorResult(fmt.Sprintf("failed to start command: %v", err))
 	}
 
 	done := make(chan error, 1)
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				logger.ErrorCF("shell", "cmd.Wait goroutine panic recovered",
+					map[string]any{
+						"panic": fmt.Sprintf("%v", r),
+						"stack": string(debug.Stack()),
+					})
+				done <- fmt.Errorf("panic in cmd.Wait: %v", r)
+			}
+		}()
 		done <- cmd.Wait()
 	}()
 
@@ -521,7 +565,9 @@ func (t *ExecTool) runBackground(ctx context.Context, command, cwd string, ptyEn
 		session.stdinWriter = stdinWriter
 	}
 
-	if err := cmd.Start(); err != nil {
+	// Background sessions use the same startup path so isolation stays consistent
+	// with synchronous exec runs.
+	if err := isolation.Start(cmd); err != nil {
 		if session.ptyMaster != nil {
 			session.ptyMaster.Close()
 		}
@@ -538,6 +584,18 @@ func (t *ExecTool) runBackground(ctx context.Context, command, cwd string, ptyEn
 	// so we need cmd.Wait() in a separate goroutine to detect process exit.
 	if session.PTY && session.ptyMaster != nil {
 		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					logger.ErrorCF("shell", "PTY cmd.Wait goroutine panic recovered",
+						map[string]any{
+							"panic": fmt.Sprintf("%v", r),
+							"stack": string(debug.Stack()),
+						})
+					session.mu.Lock()
+					session.Status = "error"
+					session.mu.Unlock()
+				}
+			}()
 			cmd.Wait() // Wait for process to exit
 			session.mu.Lock()
 			if cmd.ProcessState != nil {
@@ -548,6 +606,15 @@ func (t *ExecTool) runBackground(ctx context.Context, command, cwd string, ptyEn
 		}()
 
 		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					logger.ErrorCF("shell", "PTY read goroutine panic recovered",
+						map[string]any{
+							"panic": fmt.Sprintf("%v", r),
+							"stack": string(debug.Stack()),
+						})
+				}
+			}()
 			buf := make([]byte, 4096)
 			for {
 				n, err := session.ptyMaster.Read(buf)
@@ -578,6 +645,15 @@ func (t *ExecTool) runBackground(ctx context.Context, command, cwd string, ptyEn
 		// When Read() returns EOF (pipe closed), we break.
 		// When process exits, OS closes pipe write end → Read() returns EOF → we exit.
 		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					logger.ErrorCF("shell", "pipe read goroutine panic recovered",
+						map[string]any{
+							"panic": fmt.Sprintf("%v", r),
+							"stack": string(debug.Stack()),
+						})
+				}
+			}()
 			buf := make([]byte, 4096)
 
 			// Read stdout
@@ -639,7 +715,10 @@ func (t *ExecTool) runBackground(ctx context.Context, command, cwd string, ptyEn
 		SessionID: sessionID,
 		Status:    "running",
 	}
-	data, _ := json.Marshal(resp)
+	data, err := json.Marshal(resp)
+	if err != nil {
+		return ErrorResult(err.Error())
+	}
 	return &ToolResult{
 		ForLLM:  string(data),
 		ForUser: fmt.Sprintf("Session %s started", sessionID),
@@ -652,7 +731,10 @@ func (t *ExecTool) executeList() *ToolResult {
 	resp := ExecResponse{
 		Sessions: sessions,
 	}
-	data, _ := json.Marshal(resp)
+	data, err := json.Marshal(resp)
+	if err != nil {
+		return ErrorResult(err.Error())
+	}
 	return &ToolResult{
 		ForLLM:  string(data),
 		ForUser: fmt.Sprintf("%d active sessions", len(sessions)),
@@ -679,7 +761,10 @@ func (t *ExecTool) executePoll(args map[string]any) *ToolResult {
 		Status:    session.GetStatus(),
 		ExitCode:  session.GetExitCode(),
 	}
-	data, _ := json.Marshal(resp)
+	data, err := json.Marshal(resp)
+	if err != nil {
+		return ErrorResult(err.Error())
+	}
 	return &ToolResult{
 		ForLLM:  string(data),
 		IsError: false,
@@ -707,7 +792,10 @@ func (t *ExecTool) executeRead(args map[string]any) *ToolResult {
 		Output:    output,
 		Status:    session.GetStatus(),
 	}
-	data, _ := json.Marshal(resp)
+	data, err := json.Marshal(resp)
+	if err != nil {
+		return ErrorResult(err.Error())
+	}
 	return &ToolResult{
 		ForLLM:  string(data),
 		IsError: false,
@@ -737,7 +825,7 @@ func (t *ExecTool) executeWrite(args map[string]any) *ToolResult {
 		return ErrorResult(fmt.Sprintf("process already exited with code %d", session.GetExitCode()))
 	}
 
-	if err := session.Write(data); err != nil {
+	if err = session.Write(data); err != nil {
 		if errors.Is(err, ErrSessionDone) {
 			return ErrorResult(fmt.Sprintf("process already exited with code %d", session.GetExitCode()))
 		}
@@ -748,7 +836,10 @@ func (t *ExecTool) executeWrite(args map[string]any) *ToolResult {
 		SessionID: sessionID,
 		Status:    session.GetStatus(),
 	}
-	respData, _ := json.Marshal(resp)
+	respData, err := json.Marshal(resp)
+	if err != nil {
+		return ErrorResult(err.Error())
+	}
 	return &ToolResult{
 		ForLLM:  string(respData),
 		IsError: false,
@@ -773,7 +864,7 @@ func (t *ExecTool) executeKill(args map[string]any) *ToolResult {
 		return ErrorResult(fmt.Sprintf("process already exited with code %d", session.GetExitCode()))
 	}
 
-	if err := session.Kill(); err != nil {
+	if err = session.Kill(); err != nil {
 		return ErrorResult(fmt.Sprintf("failed to kill session: %v", err))
 	}
 
@@ -783,7 +874,10 @@ func (t *ExecTool) executeKill(args map[string]any) *ToolResult {
 		SessionID: sessionID,
 		Status:    "done",
 	}
-	data, _ := json.Marshal(resp)
+	data, err := json.Marshal(resp)
+	if err != nil {
+		return ErrorResult(err.Error())
+	}
 	return &ToolResult{
 		ForLLM:  string(data),
 		ForUser: fmt.Sprintf("Session %s killed", sessionID),
@@ -995,7 +1089,7 @@ func (t *ExecTool) executeSendKeys(args map[string]any) *ToolResult {
 		return ErrorResult(fmt.Sprintf("process already exited with code %d", session.GetExitCode()))
 	}
 
-	if err := session.Write(data); err != nil {
+	if err = session.Write(data); err != nil {
 		if errors.Is(err, ErrSessionDone) {
 			return ErrorResult(fmt.Sprintf("process already exited with code %d", session.GetExitCode()))
 		}
@@ -1007,11 +1101,38 @@ func (t *ExecTool) executeSendKeys(args map[string]any) *ToolResult {
 		Status:    "running",
 		Output:    fmt.Sprintf("Sent keys: %v", keys),
 	}
-	respData, _ := json.Marshal(resp)
+	respData, err := json.Marshal(resp)
+	if err != nil {
+		return ErrorResult(err.Error())
+	}
 	return &ToolResult{
 		ForLLM:  string(respData),
 		IsError: false,
 	}
+}
+
+// expandPowerShellEnvVars expands environment variable syntax used by both
+// PowerShell ($env:VAR) and CMD (%VAR%) to their actual values.
+func expandPowerShellEnvVars(cmd string) string {
+	// Handle PowerShell style: $env:VAR and ${env:VAR}
+	rePs := regexp.MustCompile(`\$\{?env:(\w+)\}?`)
+	cmd = rePs.ReplaceAllStringFunc(cmd, func(match string) string {
+		varName := rePs.FindStringSubmatch(match)[1]
+		if val := os.Getenv(varName); val != "" {
+			return val
+		}
+		return match
+	})
+
+	// Handle CMD style: %VAR%
+	reCmd := regexp.MustCompile(`%([^%]+)%`)
+	return reCmd.ReplaceAllStringFunc(cmd, func(match string) string {
+		varName := reCmd.FindStringSubmatch(match)[1]
+		if val := os.Getenv(varName); val != "" {
+			return val
+		}
+		return match
+	})
 }
 
 func (t *ExecTool) guardCommand(command, cwd string) string {
@@ -1049,7 +1170,8 @@ func (t *ExecTool) guardCommand(command, cwd string) string {
 	}
 
 	if t.restrictToWorkspace {
-		if strings.Contains(cmd, "..\\") || strings.Contains(cmd, "../") {
+		// Block path traversal patterns including .../.../ variants
+		if regexp.MustCompile(`\.\.(?:[\\/]\.\.)*[\\/]`).MatchString(cmd) {
 			return "Command blocked by safety guard (path traversal detected)"
 		}
 
@@ -1062,6 +1184,16 @@ func (t *ExecTool) guardCommand(command, cwd string) string {
 		// from workspace sandbox checks. file: is intentionally excluded so that
 		// file:// URIs are still validated against the workspace boundary.
 		webSchemes := []string{"http:", "https:", "ftp:", "ftps:", "sftp:", "ssh:", "git:"}
+
+		// On Windows, expand ~ and PowerShell environment variables ($env:VAR) before path checking
+		if runtime.GOOS == "windows" {
+			// Expand PowerShell environment variables ($env:VAR and ${env:VAR})
+			cmd = expandPowerShellEnvVars(cmd)
+			// Also expand ~ for completeness
+			if home, err := os.UserHomeDir(); err == nil {
+				cmd = strings.ReplaceAll(cmd, "~", filepath.FromSlash(home))
+			}
+		}
 
 		matchIndices := absolutePathPattern.FindAllStringIndex(cmd, -1)
 
@@ -1089,9 +1221,46 @@ func (t *ExecTool) guardCommand(command, cwd string) string {
 				}
 			}
 
-			p, err := filepath.Abs(raw)
+			// Skip scheme-less URL paths like "wttr.in/Beijing".
+			// When a /path is immediately preceded by a token that looks
+			// like a domain name and that token does NOT exist as a local
+			// filesystem entry, treat the path as part of a URL and skip
+			// workspace sandbox validation.
+			//
+			// The local-path-exists guard prevents symlink bypass: if
+			// "foo.bar" exists as a local symlink or directory, the path
+			// still undergoes full workspace validation (see #2965).
+			if loc[0] > 0 && raw[0] == '/' {
+				// Find the token immediately before the "/".
+				j := loc[0] - 1
+				for j >= 0 && !isShellTokenBoundary(cmd[j]) {
+					j--
+				}
+				token := cmd[j+1 : loc[0]]
+				if looksLikeDomain(token) && !localPathExists(cwd, token) {
+					continue
+				}
+			}
+
+			p, err := commandPathAbs(commandPathTextFromMatch(cmd, loc[0], loc[1]), cwdPath)
 			if err != nil {
 				continue
+			}
+
+			// Windows-specific: normalize paths to block ADS and extended-length paths
+			if runtime.GOOS == "windows" {
+				// Strip \\?\ prefix (extended-length path)
+				p = strings.TrimPrefix(p, `\\?\`)
+				// Strip NTFS alternate data streams (only if colon is not at position 1 = drive letter)
+				if idx := strings.Index(p, ":"); idx > 1 {
+					p = p[:idx]
+				}
+			}
+
+			// Check symlinks and junctions
+			resolved, err := filepath.EvalSymlinks(p)
+			if err == nil {
+				p = resolved
 			}
 
 			if safePaths[p] {
@@ -1113,6 +1282,129 @@ func (t *ExecTool) guardCommand(command, cwd string) string {
 	}
 
 	return ""
+}
+
+func commandPathAbs(pathText, cwdPath string) (string, error) {
+	if filepath.IsAbs(pathText) {
+		return filepath.Abs(pathText)
+	}
+	return filepath.Abs(filepath.Join(cwdPath, pathText))
+}
+
+func commandPathTextFromMatch(cmd string, start, end int) string {
+	raw := cmd[start:end]
+	if !strings.HasPrefix(raw, "/") || isUnixAbsolutePathMatchStart(cmd, start) {
+		return raw
+	}
+
+	tokenStart, tokenEnd := shellTokenBounds(cmd, start)
+	prefix := cmd[tokenStart:start]
+	// For --flag=rel/path, validate the value. For ambiguous attached option
+	// forms like -isystem/path, keep the slash-starting path conservative.
+	if eq := strings.IndexByte(prefix, '='); eq >= 0 {
+		return cmd[tokenStart+eq+1 : tokenEnd]
+	}
+	if strings.HasPrefix(prefix, "-") {
+		return raw
+	}
+	return cmd[tokenStart:tokenEnd]
+}
+
+func shellTokenBounds(cmd string, idx int) (int, int) {
+	start := idx
+	for start > 0 && !isShellTokenBoundary(cmd[start-1]) {
+		start--
+	}
+	end := idx
+	for end < len(cmd) && !isShellTokenBoundary(cmd[end]) {
+		end++
+	}
+	return start, end
+}
+
+// isUnixAbsolutePathMatchStart returns true when a regex match beginning with
+// "/" is actually an absolute path token, not the separator inside a relative
+// path such as "skills/foo.py".
+func isUnixAbsolutePathMatchStart(cmd string, idx int) bool {
+	if idx <= 0 {
+		return true
+	}
+
+	prev := cmd[idx-1]
+	if isShellTokenBoundary(prev) || prev == '=' || prev == ',' || prev == '(' || prev == '[' || prev == '{' {
+		return true
+	}
+
+	j := idx - 1
+	for j >= 0 && !isShellTokenBoundary(cmd[j]) {
+		j--
+	}
+	prefix := cmd[j+1 : idx]
+
+	return strings.HasPrefix(prefix, "-") && !strings.Contains(prefix, "=")
+}
+
+// isShellTokenBoundary returns true when b is a byte that separates
+// tokens in a shell command (space, tab, colon, semicolon, pipe, etc.).
+func isShellTokenBoundary(b byte) bool {
+	switch b {
+	case ' ', '\t', ':', ';', '|', '&', '<', '>', '\'', '"', '`', '\n', '\r':
+		return true
+	}
+	return false
+}
+
+// looksLikeDomain returns true when s looks like a DNS domain name:
+// it contains at least one dot, starts with an alphanumeric character,
+// and does not end with a common file extension.
+func looksLikeDomain(s string) bool {
+	if len(s) < 3 || !strings.ContainsRune(s, '.') {
+		return false
+	}
+	first := s[0]
+	if !((first >= 'a' && first <= 'z') || (first >= 'A' && first <= 'Z') || (first >= '0' && first <= '9')) {
+		return false
+	}
+	// Exclude tokens ending with common file/programming extensions,
+	// e.g. "script.py", "main.go", "app.exe".
+	if idx := strings.LastIndexByte(s, '.'); idx >= 0 {
+		ext := strings.ToLower(s[idx+1:])
+		if commonFileExtension(ext) {
+			return false
+		}
+	}
+	return true
+}
+
+// commonFileExtension returns true when ext is a file extension that
+// strongly indicates a local file rather than a domain TLD.
+func commonFileExtension(ext string) bool {
+	switch ext {
+	case "py", "js", "ts", "tsx", "jsx", "go", "rs", "rb", "php",
+		"java", "c", "cpp", "h", "hpp", "cs", "swift", "kt", "scala",
+		"sh", "bash", "zsh", "fish", "ps1", "bat", "cmd",
+		"txt", "md", "rst", "log", "json", "yaml", "yml", "toml",
+		"xml", "html", "css", "scss", "ini", "cfg", "conf", "env",
+		"exe", "dll", "so", "dylib", "lib", "a", "o", "obj",
+		"zip", "tar", "gz", "bz2", "xz", "7z", "rar",
+		"png", "jpg", "jpeg", "gif", "svg", "ico", "bmp", "webp",
+		"mp3", "mp4", "wav", "avi", "mov", "mkv", "flac",
+		"pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx",
+		"pub", "pem", "key", "crt", "cer", "p12", "pfx",
+		"bak", "tmp", "swp", "lock",
+		"ttf", "otf", "woff", "woff2", "eot",
+		"deb", "rpm", "apk", "msi", "dmg",
+		"sql", "sqlite", "db":
+		return true
+	}
+	return false
+}
+
+// localPathExists returns true when the given token resolves to an
+// existing filesystem entry relative to cwd.
+func localPathExists(cwd, token string) bool {
+	info, err := os.Lstat(filepath.Join(cwd, token))
+	return err == nil && info != nil
 }
 
 func (t *ExecTool) SetTimeout(timeout time.Duration) {
